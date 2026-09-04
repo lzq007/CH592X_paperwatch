@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CH592X 时间同步</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --line: #d9e2ef;
+      --text: #122033;
+      --muted: #5c6b7f;
+      --accent: #2457ff;
+      --accent-2: #0a8a5b;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 22px;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input, button, select {
+      font: inherit;
+    }
+    input, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #fff;
+      color: var(--text);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 10px 14px;
+      cursor: pointer;
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.good {
+      background: var(--accent-2);
+      border-color: var(--accent-2);
+      color: #fff;
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .status {
+      min-height: 40px;
+      line-height: 1.5;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #f7f9fc;
+      border: 1px solid var(--line);
+      white-space: pre-wrap;
+    }
+    .clock {
+      font-size: 24px;
+      font-weight: 600;
+      letter-spacing: 0;
+      margin: 0;
+    }
+    .subtle {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .log {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+    code {
+      background: #eef3ff;
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    @media (max-width: 640px) {
+      .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>CH592X 时间同步</h1>
+      <div id="liveClock" class="clock">--</div>
+      <div class="subtle">本机当前时间</div>
+      <div class="row">
+        <div>
+          <label for="deviceName">设备名</label>
+          <input id="deviceName" value="CH592X" readonly>
+        </div>
+        <div>
+          <label for="timeInput">要发送的时间</label>
+          <input id="timeInput" type="datetime-local" step="1">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="connectBtn" class="primary">连接设备</button>
+        <button id="syncBtn" class="good" disabled>同步时间</button>
+        <button id="refreshBtn">刷新本机时间</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <label>状态</label>
+      <div id="status" class="status">等待连接。</div>
+    </div>
+
+    <div class="panel">
+      <label>写入内容</label>
+      <pre id="packet" class="status">-</pre>
+    </div>
+  </div>
+
+  <script>
+    const SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
+    const CHAR_UUID = '0000fff1-0000-1000-8000-00805f9b34fb';
+
+    const connectBtn = document.getElementById('connectBtn');
+    const syncBtn = document.getElementById('syncBtn');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const statusEl = document.getElementById('status');
+    const packetEl = document.getElementById('packet');
+    const timeInput = document.getElementById('timeInput');
+    const liveClock = document.getElementById('liveClock');
+
+    let device = null;
+    let characteristic = null;
+    const isSecureContextPage = window.isSecureContext;
+
+    function pad(n) {
+      return String(n).padStart(2, '0');
+    }
+
+    function toLocalInputValue(date) {
+      return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate())
+      ].join('-') + 'T' + [pad(date.getHours()), pad(date.getMinutes()), pad(date.getSeconds())].join(':');
+    }
+
+    function setStatus(text, error = false) {
+      statusEl.textContent = text;
+      statusEl.style.color = error ? 'var(--danger)' : 'var(--text)';
+    }
+
+    function formatDateTime(date) {
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+             `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    }
+
+    function tickClock() {
+      const now = new Date();
+      liveClock.textContent = formatDateTime(now);
+      if (!timeInput.value || document.activeElement !== timeInput) {
+        timeInput.value = toLocalInputValue(now);
+      }
+    }
+
+    function updateEnvStatus() {
+      if (!isSecureContextPage) {
+        setStatus('当前页面不是安全上下文。请用 http://localhost 或 HTTPS 打开后再搜蓝牙。', true);
+      }
+    }
+
+    async function getNetworkTime() {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      try {
+        const resp = await fetch('https://worldtimeapi.org/api/timezone/Asia/Shanghai', {
+          signal: controller.signal,
+        });
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        const time = new Date(data.datetime);
+        if (isNaN(time.getTime())) {
+          throw new Error('无效的网络时间');
+        }
+        return time;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    function buildPacket(date) {
+      const year = date.getFullYear();
+      return new Uint8Array([
+        year & 0xff,
+        (year >> 8) & 0xff,
+        date.getMonth() + 1,
+        date.getDate(),
+        date.getHours(),
+        date.getMinutes(),
+        date.getSeconds(),
+        date.getDay()
+      ]);
+    }
+
+    function packetText(bytes) {
+      return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(' ');
+    }
+
+    async function withTimeout(promise, ms, message) {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      });
+      try {
+        return await Promise.race([promise, timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function connect() {
+      if (!navigator.bluetooth) {
+        throw new Error('当前浏览器不支持 Web Bluetooth');
+      }
+      if (!isSecureContextPage) {
+        throw new Error('Web Bluetooth 需要安全上下文，请用 localhost 或 HTTPS 打开页面');
+      }
+
+      setStatus('正在选择设备...');
+      device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [SERVICE_UUID]
+      });
+      setStatus(`已选择 ${device.name || '设备'}，正在建立 GATT 连接...`);
+
+      device.addEventListener('gattserverdisconnected', () => {
+        characteristic = null;
+        syncBtn.disabled = true;
+        setStatus('设备已断开。');
+      });
+
+      let server = null;
+      let lastErr = null;
+      for (let i = 0; i < 3; i++) {
+        try {
+          server = await device.gatt.connect();
+          break;
+        } catch (err) {
+          lastErr = err;
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      if (!server) {
+        throw lastErr || new Error('蓝牙连接失败');
+      }
+
+      setStatus('GATT 已连接，正在发现时间同步服务...');
+      const service = await withTimeout(
+        server.getPrimaryService(SERVICE_UUID),
+        5000,
+        '发现时间同步服务超时'
+      );
+      setStatus('服务已找到，正在获取写入特征...');
+      characteristic = await withTimeout(
+        service.getCharacteristic(CHAR_UUID),
+        5000,
+        '获取时间同步写入特征超时'
+      );
+      syncBtn.disabled = false;
+      setStatus(`已连接到 ${device.name || '设备'}。`);
+    }
+
+    async function writeTime() {
+      if (!characteristic) {
+        await connect();
+      }
+
+      let chosen;
+      try {
+        chosen = await getNetworkTime();
+        setStatus('已获取网络时间，正在发送...');
+      } catch (err) {
+        chosen = new Date(timeInput.value);
+        setStatus('网络时间获取失败，改用页面当前时间发送...');
+      }
+      const payload = buildPacket(chosen);
+      packetEl.textContent = packetText(payload) + `\n${formatDateTime(chosen)}`;
+
+      if (typeof characteristic.writeValueWithResponse === 'function') {
+        await characteristic.writeValueWithResponse(payload);
+      } else {
+        await characteristic.writeValue(payload);
+      }
+
+      setStatus(`时间已写入：${formatDateTime(chosen)}`);
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      try {
+        await connect();
+        await writeTime();
+      } catch (err) {
+        setStatus(err.message || String(err), true);
+      }
+    });
+
+    syncBtn.addEventListener('click', async () => {
+      try {
+        await writeTime();
+      } catch (err) {
+        setStatus(err.message || String(err), true);
+      }
+    });
+
+    refreshBtn.addEventListener('click', () => {
+      tickClock();
+      setStatus('已刷新为本机当前时间。');
+    });
+
+    tickClock();
+    updateEnvStatus();
+    setInterval(tickClock, 1000);
+    packetEl.textContent = '-';
+    setStatus('等待连接。');
+  </script>
+</body>
+</html>
