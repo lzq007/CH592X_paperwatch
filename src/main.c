@@ -63,10 +63,11 @@ static struct bt_ancs_attr notif_attr_app_id_latest;
 static uint8_t attr_appid[ATTR_DATA_SIZE];
 static uint8_t attr_title[ATTR_DATA_SIZE];
 static uint8_t attr_message[ATTR_DATA_SIZE];
-static uint8_t attr_message_size[ATTR_DATA_SIZE];
-static uint8_t attr_date[ATTR_DATA_SIZE];
-static uint8_t attr_posaction[ATTR_DATA_SIZE];
-static uint8_t attr_negaction[ATTR_DATA_SIZE];
+/* 当前未使用：这些 ANCS 属性未在 ancs_init 中注册，暂不接收 */
+/* static uint8_t attr_message_size[ATTR_DATA_SIZE]; */
+/* static uint8_t attr_date[ATTR_DATA_SIZE]; */
+/* static uint8_t attr_posaction[ATTR_DATA_SIZE]; */
+/* static uint8_t attr_negaction[ATTR_DATA_SIZE]; */
 static uint8_t attr_disp_name[ATTR_DATA_SIZE];
 
 /* String literals for the iOS notification categories.
@@ -114,8 +115,8 @@ static const char *lit_appid[BT_ANCS_APP_ATTR_COUNT] = { "Display Name" };
 #define EPD_REFRESH_EVT         0x0001
 #define CLOCK_TICK_EVT          0x0002
 #define TIME_SYNC_RESTORE_EVT   0x0008
+#define NOTIFICATION_ICON_EVT   0x0010
 
-#define CLOCK_POLL_MS           1000
 #define TIME_SYNC_STATUS_MS      1500
 
 typedef enum
@@ -132,6 +133,8 @@ static volatile uint8_t notification_beep_pending = 0;
 static app_screen_t app_screen = APP_SCREEN_CLOCK;
 static uint8_t notification_unread = 0;
 static uint8_t notification_pending_during_detail = 0;
+/* Removed 事件可能在覆盖层或详情页显示期间到达，延后到时钟界面清除图标。 */
+static uint8_t notification_icon_clear_pending = 0;
 /* 消息图标是否已显示：通知未读且图标未显示时，CLOCK_TICK 会持续重试刷新，
  * 避免通知到达时覆盖层锁定/详情页导致图标刷新被跳过、直到分钟变化才恢复。 */
 static uint8_t msg_icon_shown = 0;
@@ -141,6 +144,8 @@ static RX8010SJ_Time clock_time_last;
 static volatile uint8_t time_sync_session_active = 0;
 static volatile uint8_t time_sync_restore_to_waiting = 0;
 static volatile uint8_t time_sync_status_visible = 0;
+/* 上一次打印过的 RTC 秒值：细粒度轮询下按秒节流串口输出 */
+static uint8_t clock_print_last_second = 0xFF;
 
 static struct {
     uint8_t appid[ATTR_DATA_SIZE];
@@ -182,6 +187,15 @@ static uint8_t clock_date_changed(const RX8010SJ_Time *now)
 
 static void clock_render(const RX8010SJ_Time *now)
 {
+    /* 蓝牙图标状态变化时强制一次局刷：覆盖层/日期变化会走全刷波形，屏幕呈现的
+     * 是旧图标，与 EPD_Image_prev 基准错位后快刷无法再擦除，必须借局刷把新帧
+     * 与基准对齐。 */
+    if(EPD_IsBluetoothIconDirty())
+    {
+        clock_force_partial_once = 1;
+        clock_force_refresh = 0;
+    }
+
     if(clock_force_partial_once)
     {
         EPD_Show_ClockPartial(now, notification_unread);
@@ -198,11 +212,24 @@ static void clock_render(const RX8010SJ_Time *now)
 
     /* 时钟重绘已包含消息图标，同步图标显示状态（若通知未读则已显示） */
     msg_icon_shown = (uint8_t)(notification_unread ? 1 : 0);
+    if(!notification_unread)
+    {
+        notification_icon_clear_pending = 0;
+    }
 
     clock_time_last = *now;
     clock_time_valid = 1;
     clock_force_refresh = 0;
     clock_error_shown = 0;
+}
+
+/* 时间同步等待/状态页是否正占据屏幕（此时不显示时钟界面）。
+ * 用于屏蔽通知提醒音：等待广播时间同步期间蜂鸣器不应鸣响。 */
+static uint8_t time_sync_ui_active(void)
+{
+    return (uint8_t)(time_sync_session_active ||
+                     time_sync_restore_to_waiting ||
+                     time_sync_status_visible);
 }
 
 static void time_sync_begin_session(void)
@@ -308,37 +335,86 @@ static void epd_queue_refresh(void)
     notification_unread = 1;
     notification_pending_during_detail =
         (uint8_t)(app_screen == APP_SCREEN_NOTIFICATION_DETAIL);
-    /* 强制下一次时钟 tick 立即局部刷新，确保消息图标（右上角）及时出现，
-     * 而不必等到分钟变化或其它刷新条件。 */
-    if(app_screen == APP_SCREEN_CLOCK && !EPD_IsOverlayLocked())
-    {
-        clock_force_partial_once = 1;
-    }
     tmos_set_event(appTaskID, EPD_REFRESH_EVT);
 }
 
+/* 串口时间打印：输出 RTC 读到的完整时间（含秒与星期）。
+ * 墨水屏时钟页只画 HH:MM，无法从屏幕上判断秒级偏差，只能靠串口比对。 */
+static void clock_print_time(const char *tag, const RX8010SJ_Time *t)
+{
+    PRINT("%s %04u-%02u-%02u %02u:%02u:%02u w%u\n", tag,
+          (unsigned int)t->year, (unsigned int)t->month, (unsigned int)t->day,
+          (unsigned int)t->hour, (unsigned int)t->minute, (unsigned int)t->second,
+          (unsigned int)t->weekday);
+}
+
+/* 时钟轮询节拍。RX8010SJ 是外部 RTC，走自己的晶振，其秒沿与 MCU 定时器没有
+ * 相位关系，也无法读取亚秒相位。常规按 1 秒轮询；进入秒值 58 后改为细粒度
+ * 轮询，把「发现分钟翻转」的滞后从平均 500ms 压到 CLOCK_TICK_FINE_MS 以内。 */
+#define CLOCK_TICK_NORMAL_MS    1000
+#define CLOCK_TICK_FINE_MS      20      /* 细粒度轮询周期，即秒沿检测精度 */
+#define CLOCK_TICK_FINE_FROM    58      /* 秒值 >= 此值时进入细粒度轮询 */
+
+static void clock_tick_reschedule(const RX8010SJ_Time *now)
+{
+    uint32_t delay_ms = (now && now->second >= CLOCK_TICK_FINE_FROM)
+                        ? CLOCK_TICK_FINE_MS : CLOCK_TICK_NORMAL_MS;
+
+    tmos_start_task(appTaskID, CLOCK_TICK_EVT, MS1_TO_SYSTEM_TIME(delay_ms));
+}
 static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
 {
-    if (events & EPD_REFRESH_EVT)
+    if (events & NOTIFICATION_ICON_EVT)
     {
-        /* 收到通知时立即独立刷新右上角消息图标（不重绘整个时钟，刷新快）。
-         * 仅在时钟界面时刷新：EPD_UpdateClockMessageIcon 直接操作 EPD_Image，
-         * 若在详情页刷新会破坏详情页帧。 */
-        if (notification_unread && app_screen == APP_SCREEN_CLOCK &&
-            !time_sync_session_active && !time_sync_restore_to_waiting &&
-            !time_sync_status_visible && !EPD_IsOverlayLocked())
+        /* 鸣响期间推迟图标刷新：图标刷新会触发阻塞式墨水屏刷新（忙等待自旋），
+         * 会推迟蜂鸣器 PWM 的关断、把"滴"声拉长。蜂鸣仅约 320ms，稍后刷新即可。 */
+        if (BUZZER_IsBeeping())
         {
-            EPD_UpdateClockMessageIcon(1);
-            msg_icon_shown = 1;
+            tmos_start_task(appTaskID, NOTIFICATION_ICON_EVT,
+                            MS1_TO_SYSTEM_TIME(100));
+            return events ^ NOTIFICATION_ICON_EVT;
         }
 
-        if (time_sync_session_active || time_sync_restore_to_waiting || time_sync_status_visible)
+        /* app_screen and the overlay lock are the actual display ownership
+         * state.  The time-sync flags may remain active while the clock is
+         * already visible, so using them here can postpone this event until
+         * the next minute refresh. */
+        if (app_screen == APP_SCREEN_CLOCK && !EPD_IsOverlayLocked())
         {
-            if (notification_beep_pending)
+            if(notification_icon_clear_pending)
             {
-                notification_beep_pending = 0;
-                BUZZER_NotifyBeep();
+                PRINT("  [EPD] clearing removed notification icon\n");
+                EPD_UpdateClockMessageIcon(0);
+                notification_icon_clear_pending = 0;
+                msg_icon_shown = 0;
+                PRINT("  [EPD] removed notification icon cleared\n");
             }
+            else if(notification_unread && !msg_icon_shown)
+            {
+                PRINT("  [EPD] showing notification icon\n");
+                EPD_UpdateClockMessageIcon(1);
+                msg_icon_shown = 1;
+                PRINT("  [EPD] notification icon shown\n");
+            }
+        }
+        else if(app_screen == APP_SCREEN_CLOCK &&
+                (notification_icon_clear_pending ||
+                 (notification_unread && !msg_icon_shown)))
+        {
+            tmos_start_task(appTaskID, NOTIFICATION_ICON_EVT,
+                            MS1_TO_SYSTEM_TIME(100));
+        }
+
+        return events ^ NOTIFICATION_ICON_EVT;
+    }
+
+    if (events & EPD_REFRESH_EVT)
+    {
+        if (time_sync_ui_active())
+        {
+            /* 等待时间同步期间保持等待页，通知提醒音一并丢弃：
+             * 该页面只表示"等待蓝牙广播时间同步"，不应因消息通知而鸣响。 */
+            notification_beep_pending = 0;
             return events ^ EPD_REFRESH_EVT;
         }
 
@@ -350,7 +426,7 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
         }
 
         if (app_screen == APP_SCREEN_CLOCK &&
-            (notification_unread || ancs_pairing_success_refresh_pending))
+            ancs_pairing_success_refresh_pending)
         {
             RX8010SJ_Time now;
             if(ancs_pairing_success_refresh_pending && RX8010SJ_ReadTime(&now))
@@ -390,9 +466,24 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
             if(req.type == TIME_SYNC_REQ_TIME && time_sync_session_active)
             {
                 EPD_SetOverlayLock(1);
-                EPD_Show_TimeSyncSyncing();
 
-                if(RX8010SJ_SetTime(&req.time))
+                /* Write the RTC before any e-paper refresh.  EPD refreshes are
+                 * blocking and can take multiple seconds, which would make
+                 * the received second value stale before it reaches the RTC. */
+                clock_print_time("[timesync] req ", &req.time);
+                uint8_t time_set_ok = RX8010SJ_SetTime(&req.time);
+                {
+                    /* 回读用于量化写入延迟：与 req 的秒差即手机侧推算到
+                     * RTC 落地之间的残余滞后。 */
+                    RX8010SJ_Time verify;
+                    if(RX8010SJ_ReadTime(&verify))
+                    {
+                        clock_print_time("[timesync] rtc ", &verify);
+                    }
+                }
+
+                EPD_Show_TimeSyncSyncing();
+                if(time_set_ok)
                 {
                     clock_time_last = req.time;
                     clock_time_valid = 1;
@@ -452,6 +543,14 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
     {
         RX8010SJ_Time now;
 
+        /* 鸣响期间推迟一切屏幕刷新：忙等待式刷新会推迟蜂鸣器 PWM 关断，
+         * 把"滴"声拉长。时钟最迟在鸣响结束后的下一轮 tick 补刷。 */
+        if (BUZZER_IsBeeping())
+        {
+            clock_tick_reschedule(NULL);
+            return events ^ CLOCK_TICK_EVT;
+        }
+
         if (ancs_pairing_success_refresh_pending)
         {
             app_screen = APP_SCREEN_CLOCK;
@@ -463,7 +562,26 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
         if (EPD_IsOverlayLocked())
         {
             clock_refresh_blocked = 1;
+            clock_tick_reschedule(NULL);
             return events ^ CLOCK_TICK_EVT;
+        }
+
+        /* 蓝牙图标状态变化（连接/断开）后尽快重绘：借局刷让屏幕与 EPD_Image_prev
+         * 基准同步，避免图标残留在下一分钟刷新前都不消失。 */
+        if (EPD_IsBluetoothIconDirty())
+        {
+            clock_force_partial_once = 1;
+            clock_force_refresh = 0;
+        }
+
+        if (notification_icon_clear_pending &&
+            app_screen == APP_SCREEN_CLOCK &&
+            !EPD_IsOverlayLocked())
+        {
+            EPD_UpdateClockMessageIcon(0);
+            notification_icon_clear_pending = 0;
+            msg_icon_shown = 0;
+            PRINT("  [EPD] removed notification icon cleared (retry)\n");
         }
 
         /* 消息图标重试：通知未读但图标尚未显示（此前可能因覆盖层锁定/详情页
@@ -482,10 +600,19 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
                 EPD_Show_Notification("Clock", "RX8010SJ", "RTC read fail");
                 clock_error_shown = 1;
             }
+            clock_tick_reschedule(NULL);
             return events ^ CLOCK_TICK_EVT;
         }
 
         clock_error_shown = 0;
+
+        /* 打印 RTC 读数，用于与手机比对分钟翻转。细粒度轮询期间每 20ms 就
+         * 触发一次，按秒值节流，避免同一秒重复输出。 */
+        if (now.second != clock_print_last_second)
+        {
+            clock_print_last_second = now.second;
+            clock_print_time("[tick]", &now);
+        }
 
         if (clock_refresh_blocked)
         {
@@ -494,16 +621,25 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
         }
 
         if (app_screen == APP_SCREEN_CLOCK &&
-            (clock_force_partial_once || clock_force_refresh || clock_time_changed(&now) ||
-             ancs_pairing_success_refresh_pending))
+            (clock_force_partial_once || clock_force_refresh ||
+             clock_time_changed(&now) || ancs_pairing_success_refresh_pending))
         {
+            /* 量化阻塞式刷屏耗时：局刷约 800ms，面板在波形结束后才呈现新画面，
+             * 这是细粒度轮询之外剩余的显示延迟。 */
+            uint32_t render_start = get_current_time();
             clock_render(&now);
+            PRINT("[tick] render %ums\n",
+                  (unsigned int)(get_current_time() - render_start));
+
             if (ancs_pairing_success_refresh_pending)
             {
                 ancs_pairing_success_refresh_pending = 0;
             }
         }
 
+        /* 一次性任务而非重载任务：需要按当前秒值改变下一次的间隔。
+         * 所有提前返回的分支都已各自重排期，否则时钟会永久停摆。 */
+        clock_tick_reschedule(&now);
         return events ^ CLOCK_TICK_EVT;
     }
 
@@ -513,7 +649,7 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
 
 
 
-static void notif_print(struct bt_ancs_evt_notif *notif)
+static void notif_print(const struct bt_ancs_evt_notif *notif)
 {
     PRINT("\nNotification\n");
     PRINT("Event:       %s\n", lit_eventid[notif->evt_id]);
@@ -611,8 +747,29 @@ static void bt_ancs_notification_source_handler(struct bt_ancs_client *ancs_c,
         int err, const struct bt_ancs_evt_notif *notif)
 {
     if (!err) {
-        notification_latest = *notif;
-        notif_print(&notification_latest);
+        notif_print(notif);
+
+        if(notif->evt_id == BT_ANCS_EVENT_ID_NOTIFICATION_REMOVED)
+        {
+            if(notification_unread &&
+               notification_latest.notif_uid == notif->notif_uid)
+            {
+                notification_unread = 0;
+                notification_pending_during_detail = 0;
+                notification_icon_clear_pending = 1;
+                tmos_set_event(appTaskID, NOTIFICATION_ICON_EVT);
+                PRINT("  [EPD] removed current UID=%lu, clear icon queued\n",
+                      (unsigned long)notif->notif_uid);
+            }
+            else
+            {
+                PRINT("  [EPD] removed UID=%lu ignored, current UID=%lu unread=%u\n",
+                      (unsigned long)notif->notif_uid,
+                      (unsigned long)notification_latest.notif_uid,
+                      notification_unread);
+            }
+            return;
+        }
 
         /* 只处理"新增"且非"重连同步的历史通知"：
          * - 重连时 iOS 会同步大量 pre-existing 通知，这些不是新消息，无需显示
@@ -630,16 +787,19 @@ static void bt_ancs_notification_source_handler(struct bt_ancs_client *ancs_c,
             return;
         }
 
+        notification_latest = *notif;
         notification_unread = 1;
         notification_pending_during_detail =
             (uint8_t)(app_screen == APP_SCREEN_NOTIFICATION_DETAIL);
-        notification_beep_pending = 1;
+        notification_icon_clear_pending = 0;
+        /* 等待蓝牙广播时间同步期间不鸣响提醒音 */
+        notification_beep_pending = time_sync_ui_active() ? 0 : 1;
         /* 新通知到达，清空旧内容防止详情页显示残留 */
         epd_pending.appid[0] = '\0';
         epd_pending.title[0] = '\0';
         epd_pending.message[0] = '\0';
-        /* 图标未显示，等待时钟 tick 重试刷新 */
-        msg_icon_shown = 0;
+        /* 使用独立事件刷新图标；图标已显示时无需重复刷新。 */
+        tmos_set_event(appTaskID, NOTIFICATION_ICON_EVT);
         tmos_set_event(appTaskID, EPD_REFRESH_EVT);
 
         /* 收到新消息通知，请求属性详情（App 名/标题/消息全文等），
@@ -662,6 +822,16 @@ static void bt_ancs_data_source_handler(struct bt_ancs_client *ancs_c,
      *   不能依赖"三个属性收齐"作为触发条件） */
     switch (response->command_id) {
     case BT_ANCS_COMMAND_ID_GET_NOTIF_ATTRIBUTES:
+        if(!notification_unread ||
+           response->notif_uid != notification_latest.notif_uid)
+        {
+            PRINT("  [EPD] stale attrs UID=%lu ignored, current UID=%lu unread=%u\n",
+                  (unsigned long)response->notif_uid,
+                  (unsigned long)notification_latest.notif_uid,
+                  notification_unread);
+            break;
+        }
+
         notif_attr_latest = response->attr;
         notif_attr_print(&notif_attr_latest);
         if (response->attr.attr_id ==
@@ -886,7 +1056,9 @@ int main(void)
             PRINT("RX8010SJ init fail\n");
         }
 
-        tmos_start_reload_task(appTaskID, CLOCK_TICK_EVT, MS1_TO_SYSTEM_TIME(CLOCK_POLL_MS));
+        /* 时钟轮询改为一次性任务自我重排期（见 clock_tick_reschedule），
+         * 以便在分钟翻转前切换成细粒度轮询、压掉显示滞后。 */
+        tmos_start_task(appTaskID, CLOCK_TICK_EVT, MS1_TO_SYSTEM_TIME(CLOCK_TICK_NORMAL_MS));
     }
 
     HalKeyConfig(button_changed);

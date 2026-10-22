@@ -30,6 +30,7 @@ void EPD_Show_TimeSyncTimeout(void);
 void EPD_RequestFullRefreshOnce(void);
 void EPD_UpdateClockMessageIcon(uint8_t show);
 void EPD_UpdateClockBluetoothIcon(uint8_t show);
+uint8_t EPD_IsBluetoothIconDirty(void);
 void EPD_Show_Passcode(uint32_t passcode);
 void EPD_Show_BluetoothConnected(void);
 void EPD_SetOverlayLock(uint8_t locked);

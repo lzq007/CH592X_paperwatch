@@ -28,8 +28,12 @@ static tmosTaskID buzzerTaskID;
 /* 剩余鸣响次数 */
 static uint8_t buzzerBeepLeft;
 
-/* 当前阶段：0=鸣响，1=静音间隔 */
+/* 当前阶段：0=鸣响，1=静音间隔，2=收尾 */
 static uint8_t buzzerStage;
+
+/* 是否有鸣响序列正在进行（含静音间隔）。阻塞式墨水屏刷新会推迟 PWM 关断、
+ * 把"滴"声拉长，调用方可据此把刷新推迟到鸣响结束。 */
+static volatile uint8_t buzzerActive;
 
 /* 蜂鸣器 TMOS 事件处理 */
 static tmosEvents BUZZER_ProcessEvent(tmosTaskID task_id, tmosEvents events);
@@ -85,6 +89,7 @@ static tmosEvents BUZZER_ProcessEvent(tmosTaskID task_id, tmosEvents events)
             /* 收尾：关闭 PWM，彻底结束 */
             PWMX_ACTOUT(BUZZER_PWM_CH, 128, High_Level, DISABLE);
             buzzerStage = 0;
+            buzzerActive = 0;
         }
         return (events ^ BUZZER_BEEP_EVENT);
     }
@@ -106,6 +111,7 @@ void BUZZER_Init(void)
     buzzerTaskID = TMOS_ProcessEventRegister(BUZZER_ProcessEvent);
     buzzerBeepLeft = 0;
     buzzerStage = 0;
+    buzzerActive = 0;
 
     /* 配置 PWM7 输出：频率 ~2.7kHz
      * 系统时钟 60MHz，PWM 基准时钟 = d * Tsys = 85 * (1/60MHz)
@@ -168,6 +174,7 @@ void BUZZER_Stop(void)
     PWMX_ACTOUT(BUZZER_PWM_CH, 128, High_Level, DISABLE);
     buzzerBeepLeft = 0;
     buzzerStage = 0;
+    buzzerActive = 0;
     tmos_stop_task(buzzerTaskID, BUZZER_BEEP_EVENT);
 }
 
@@ -186,7 +193,13 @@ void BUZZER_NotifyBeep(void)
     BUZZER_Stop();
     buzzerBeepLeft = BUZZER_TIMES;
     buzzerStage = 0;
+    buzzerActive = 1;
     tmos_start_task(buzzerTaskID, BUZZER_BEEP_EVENT, 0);
+}
+
+uint8_t BUZZER_IsBeeping(void)
+{
+    return buzzerActive;
 }
 
 /******************************** endfile @ BUZZER ******************************/

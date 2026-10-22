@@ -31,17 +31,35 @@ static uint8_t epd_refresh_count = 0;
 static volatile uint8_t epd_need_full = 0;
 static volatile uint8_t epd_overlay_lock = 0;
 static volatile uint8_t epd_force_full_refresh_once = 0;
+/* 蓝牙图标状态：
+ * epd_bt_icon_target   —— 应当显示的目标状态，随 ancs_ble_connected 同步
+ * epd_bt_icon_rendered —— 上一帧时钟页实际画到屏幕上的状态
+ * epd_bt_icon_dirty    —— 目标状态变化，待 main 的 CLOCK_TICK 触发重绘 */
+static uint8_t epd_bt_icon_target = 0;
+static uint8_t epd_bt_icon_rendered = 0;
+static volatile uint8_t epd_bt_icon_dirty = 0;
 
 static sFONT *EPD_font_app   = &Font16;
 static sFONT *EPD_font_title = &Font20;
 static sFONT *EPD_font_body  = &Font16;
 
+/* 屏幕逻辑方向：ROTATE_0 为横屏 192x176（文字右转 90°），
+ * ROTATE_270 为原来的竖屏 176x192。所有界面坐标都按逻辑尺寸推导。 */
+#define EPD_UI_ROTATE      ROTATE_0
+#if (EPD_UI_ROTATE == ROTATE_90) || (EPD_UI_ROTATE == ROTATE_270)
+#define EPD_UI_W           EPD_HEIGHT
+#define EPD_UI_H           EPD_WIDTH
+#else
+#define EPD_UI_W           EPD_WIDTH
+#define EPD_UI_H           EPD_HEIGHT
+#endif
+
 #define EPD_UI_MARGIN      4
 #define EPD_UI_APP_H       24
 #define EPD_UI_TITLE_Y     30
 #define EPD_UI_BODY_Y      60
-#define EPD_UI_BODY_MAX_H  (EPD_HEIGHT - EPD_UI_BODY_Y - 4)
-#define EPD_UI_TEXT_W      (EPD_HEIGHT - EPD_UI_MARGIN * 2)
+#define EPD_UI_BODY_MAX_H  (EPD_UI_H - EPD_UI_BODY_Y - 4)
+#define EPD_UI_TEXT_W      (EPD_UI_W - EPD_UI_MARGIN * 2)
 #define EPD_MSG_ICON_X      (EPD_UI_TEXT_W - 22)
 #define EPD_MSG_ICON_W      20
 #define EPD_MSG_ICON_H      17
@@ -696,6 +714,19 @@ static void epd_draw_scaled_string_centered(uint16_t y, const char *text,
     }
 }
 
+/* 由 main 的 CLOCK_TICK 调用：读取并清除图标待刷新标记 */
+uint8_t EPD_IsBluetoothIconDirty(void)
+{
+    uint8_t dirty = epd_bt_icon_dirty;
+
+    if(dirty)
+    {
+        epd_bt_icon_dirty = 0;
+    }
+
+    return dirty;
+}
+
 void EPD_UpdateClockMessageIcon(uint8_t show)
 {
     Paint_SelectImage(EPD_Image);
@@ -714,22 +745,21 @@ void EPD_UpdateClockMessageIcon(uint8_t show)
     tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
 }
 
+/* 蓝牙图标状态切换（连接=1/断开=0）时调用：只置标记，实际刷新交给
+ * main 的下一次 CLOCK_TICK（clock_render 走局刷，按 ancs_ble_connected 重画）。
+ * 不在此处直接刷屏：连接成功时覆盖层「蓝牙连接成功」仍锁定屏幕，直接刷会被
+ * 随后的时钟重绘覆盖成旧状态。 */
 void EPD_UpdateClockBluetoothIcon(uint8_t show)
 {
-    Paint_SelectImage(EPD_Image);
-    Paint_ClearWindows(EPD_BT_ICON_WIN_X, EPD_BT_ICON_Y,
-                       (uint16_t)(EPD_BT_ICON_WIN_X + EPD_BT_ICON_WIN_W - 1),
-                       (uint16_t)(EPD_BT_ICON_Y + EPD_BT_ICON_H - 1),
-                       WHITE);
-
-    if(show)
+    /* 目标状态已与屏幕一致则无需刷新。调用方在赋值 ancs_ble_connected 后立即
+     * 调用，因此比较的是「当前已呈现」的状态。 */
+    if((show ? 1 : 0) == epd_bt_icon_target)
     {
-        epd_draw_bluetooth_icon(EPD_BT_ICON_X, EPD_BT_ICON_Y);
+        return;
     }
 
-    EPD_HW_Init_GUI();
-    EPD_Display_FastSync(EPD_Image, EPD_Image_prev);
-    tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
+    epd_bt_icon_target = show ? 1 : 0;
+    epd_bt_icon_dirty = 1;
 }
 
 static void epd_refresh_frame(uint8_t force_full, uint8_t notify_buzzer)
@@ -780,12 +810,12 @@ static void epd_refresh_clock_frame(uint8_t force_full)
 
 static void epd_prepare_clock_base(uint8_t has_message)
 {
-    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, 270, WHITE);
+    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
     Paint_SelectImage(EPD_Image);
     Paint_Clear(WHITE);
 
     /* 蓝牙连接时在右上角显示蓝牙图标（位于消息图标左侧） */
-    if(ancs_ble_connected)
+    if(epd_bt_icon_target)
     {
         epd_draw_bluetooth_icon(EPD_BT_ICON_X, EPD_BT_ICON_Y);
     }
@@ -807,6 +837,7 @@ static void epd_show_clock_demo(const RX8010SJ_Time *time, uint8_t has_message,
     uint16_t date_y;
     uint16_t week_y;
     uint16_t clock_y;
+    uint8_t epd_needs_full;
     static const char *weekday_utf8[] = {
         "日", "一", "二", "三", "四", "五", "六"
     };
@@ -843,8 +874,24 @@ static void epd_show_clock_demo(const RX8010SJ_Time *time, uint8_t has_message,
     epd_draw_scaled_string_centered(clock_y, hhmm, EPD_CLOCK_FONT,
                                     EPD_CLOCK_SCALE, BLACK);
 
-    if((epd_can_full_refresh() || epd_force_full_refresh_once) &&
-       (force_full || epd_need_full || epd_refresh_count >= EPD_CLOCK_REFRESH_CNT))
+    /* 本帧是否本应走全刷 */
+    epd_needs_full = (uint8_t)((epd_can_full_refresh() ||
+                                epd_force_full_refresh_once) &&
+                               (force_full || epd_need_full ||
+                                epd_refresh_count >= EPD_CLOCK_REFRESH_CNT));
+
+    /* 移除蓝牙图标必须走局刷：全刷波形会把当前屏幕（含旧图标）当作新基准写入
+     * 0x26，之后差分局刷再无法擦除图标。若本应全刷则推迟一帧补上，避免残影累积。 */
+    if(epd_bt_icon_rendered && !epd_bt_icon_target)
+    {
+        EPD_Display_FastSync(EPD_Image, EPD_Image_prev);
+        epd_refresh_clock_frame(0);
+        if(epd_needs_full)
+        {
+            epd_need_full = 1;
+        }
+    }
+    else if(epd_needs_full)
     {
         EPD_Display_Full_Sync(EPD_Image);
         epd_refresh_clock_frame(1);
@@ -855,6 +902,7 @@ static void epd_show_clock_demo(const RX8010SJ_Time *time, uint8_t has_message,
         epd_refresh_clock_frame(0);
     }
 
+    epd_bt_icon_rendered = epd_bt_icon_target;
     tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
     epd_force_full_refresh_once = 0;
 }
@@ -866,7 +914,7 @@ static void epd_show_sync_status_page(const char *text)
     BUZZER_Stop();
     epd_overlay_lock = 1;
 
-    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, 270, WHITE);
+    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
     Paint_SelectImage(EPD_Image);
     Paint_Clear(WHITE);
 
@@ -887,6 +935,9 @@ void EPD_Show_Init(void)
     epd_refresh_count = 0;
     epd_overlay_lock = 0;
     epd_force_full_refresh_once = 0;
+    epd_bt_icon_target = 0;
+    epd_bt_icon_rendered = 0;
+    epd_bt_icon_dirty = 0;
 }
 
 void EPD_SetOverlayLock(uint8_t locked)
@@ -904,7 +955,7 @@ static void epd_show_notification_page(const char *app_name, const char *title,
 {
     uint16_t y;
 
-    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, 270, WHITE);
+    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
     Paint_SelectImage(EPD_Image);
     Paint_Clear(WHITE);
 
@@ -1042,7 +1093,7 @@ void EPD_Show_Passcode(uint32_t passcode)
     code[6] = '\0';
 
     Paint_SelectImage(EPD_Image);
-    Paint_ClearWindows(0, EPD_STATUS_Y, EPD_WIDTH, EPD_HEIGHT, WHITE);
+    Paint_ClearWindows(0, EPD_STATUS_Y, EPD_UI_W, EPD_UI_H, WHITE);
     epd_draw_centered_utf8(EPD_STATUS_LABEL_Y, "配对码", BLACK);
     epd_draw_centered_utf8(EPD_STATUS_VALUE_Y, code, BLACK);
     epd_refresh_status_window();
@@ -1053,7 +1104,7 @@ void EPD_Show_BluetoothConnected(void)
     BUZZER_Stop();
 
     Paint_SelectImage(EPD_Image);
-    Paint_ClearWindows(0, EPD_STATUS_Y, EPD_WIDTH, EPD_HEIGHT, WHITE);
+    Paint_ClearWindows(0, EPD_STATUS_Y, EPD_UI_W, EPD_UI_H, WHITE);
     epd_draw_centered_utf8(EPD_STATUS_SINGLE_Y, "蓝牙连接成功", BLACK);
     epd_refresh_status_window();
 }

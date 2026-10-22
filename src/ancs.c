@@ -30,8 +30,8 @@
 // What is the advertising interval when device is discoverable (units of 625us, 80=50ms)
 #define DEFAULT_ADVERTISING_INTERVAL         80
 
-// Minimum connection interval (units of 1.25ms, 6=7.5ms)
-#define DEFAULT_DESIRED_MIN_CONN_INTERVAL    6
+// Minimum connection interval (units of 1.25ms, 12=15ms)
+#define DEFAULT_DESIRED_MIN_CONN_INTERVAL    12
 
 // Maximum connection interval (units of 1.25ms, 100=125ms)
 #define DEFAULT_DESIRED_MAX_CONN_INTERVAL    100
@@ -55,6 +55,10 @@
 
 // Default parameter update delay in 0.625ms
 #define DEFAULT_PARAM_UPDATE_DELAY          160
+
+// Delay the initial security request slightly so the link is fully settled
+// before we ask iOS to begin encryption/bonding.
+#define DEFAULT_SECURITY_REQ_DELAY_MS       300
 
 // Default phy update delay in 0.625ms
 #define DEFAULT_PHY_UPDATE_DELAY            2400
@@ -102,47 +106,58 @@ struct bt_ancs_client ancs_c;
 // GAP - SCAN RSP data (max size = 31 bytes)
 static uint8_t scanRspData[] = {
     // complete name
-    0x07, // length of this data
+    0x05, // length of this data
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
+    'A',
+    'N',
     'C',
-    'H',
-    '5',
-    '9',
-    '2',
-    'X',
+    'S',
 
     // connection interval range
     0x05, // length of this data
     GAP_ADTYPE_SLAVE_CONN_INTERVAL_RANGE,
-    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 100ms
+    LO_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL), // 15ms
     HI_UINT16(DEFAULT_DESIRED_MIN_CONN_INTERVAL),
-    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL), // 1s
+    LO_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL), // 125ms
     HI_UINT16(DEFAULT_DESIRED_MAX_CONN_INTERVAL),
 
     // Tx power level
     0x02, // length of this data
     GAP_ADTYPE_POWER_LEVEL,
-    0 // 0dBm
+    0, // 0dBm
+
+    // Accessory classification is also available through active scanning.
+    0x03,
+    GAP_ADTYPE_APPEARANCE,
+    LO_UINT16(GAP_APPEARE_GENERIC_WATCH),
+    HI_UINT16(GAP_APPEARE_GENERIC_WATCH),
 };
 
 // GAP - Advertisement data (max size = 31 bytes, though this is
 // best kept short to conserve power while advertising)
 static uint8_t advertData[] = {
-    // Flags; use general discoverable mode so the browser can find it
-    // without racing a short limited advertising window.
+    // Remain generally discoverable so newer iOS versions do not treat the
+    // advertisement as an expired limited-discovery session.
     0x02, // length of this data
     GAP_ADTYPE_FLAGS,
     GAP_ADTYPE_FLAGS_GENERAL | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED,
 
-    // service UUID, to notify central devices what services are included
-    // in this peripheral
+    // Solicit the ANCS service hosted by iOS.
     0x11,                  // length of this data
-    GAP_ADTYPE_SERVICES_LIST_128BIT, // some of the UUID's, but not all
+    GAP_ADTYPE_SERVICES_LIST_128BIT,
     ANCS_SVC_UUID,
 
-    0x07,
+    // Keep the complete name in the primary advertisement because iOS may
+    // skip active scanning and therefore not receive the scan response.
+    0x05,
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
-    'C', 'H', '5', '9', '2', 'X',
+    'A', 'N', 'C', 'S',
+
+    // Advertise the primary service that this accessory actually hosts.
+    0x03,
+    GAP_ADTYPE_16BIT_COMPLETE,
+    LO_UINT16(TIME_SYNC_SERVICE_UUID),
+    HI_UINT16(TIME_SYNC_SERVICE_UUID),
 };
 
 
@@ -155,8 +170,17 @@ static peripheralConnItem_t ancs_conn_list = {
 
 static uint8_t discoveryState = DISC_ANCS_START;
 
+/* ANCS 服务发现过程中缓存的句柄与临时状态。必须随每条连接复位：
+ * Ancs_handleCache 残留旧连接的句柄会让 CCCD 发现被跳过，导致订阅时
+ * 写入句柄 0（ATT_ERR_INVALID_HANDLE），并在重试逻辑里死循环。 */
+static uint16_t Ancs_svcStartHdl;
+static uint16_t Ancs_svcEndHdl;
+static uint8_t Ancs_endHdlIdx;
+static uint8_t isNotifCCCD = FALSE;
+
 // GAP GATT Attributes
-static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "CH592X";
+static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "ANCS";
+static uint16_t gapAppearance = GAP_APPEARE_GENERIC_WATCH;
 
 
 /*********************************************************************
@@ -196,6 +220,16 @@ static volatile uint8_t pending_pairing_success_valid;
 volatile uint8_t ancs_ble_connected;
 volatile uint8_t ancs_pairing_success_refresh_pending;
 
+typedef enum {
+    ANCS_WRITE_NONE,
+    ANCS_WRITE_DS_CCCD,
+    ANCS_WRITE_NS_CCCD,
+} ancs_write_pending_t;
+
+/* ATT_WRITE_RSP has no handle, so keep CCCD writes strictly serialized and
+ * remember which request owns the next response. */
+static ancs_write_pending_t ancs_write_pending;
+
 /* Temporary switch for debugging pairing behavior.
  * 0: do not show the passcode on the EPD.
  * 1: show the passcode on the EPD.
@@ -231,10 +265,12 @@ void peripheral_ancs_client_init(void)
     // Setup the GAP Peripheral Role Profile
     {
         uint8_t  initial_advertising_enable = TRUE;
+        uint8_t  advertising_event_type = GAP_ADTYPE_ADV_IND;
         uint16_t desired_min_interval = DEFAULT_DESIRED_MIN_CONN_INTERVAL;
         uint16_t desired_max_interval = DEFAULT_DESIRED_MAX_CONN_INTERVAL;
 
         // Set the GAP Role Parameters
+        GAPRole_SetParameter(GAPROLE_ADV_EVENT_TYPE, sizeof(uint8_t), &advertising_event_type);
         GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &initial_advertising_enable);
         GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
         GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
@@ -255,16 +291,20 @@ void peripheral_ancs_client_init(void)
 
     // Setup the GAP Bond Manager
     {
+        uint32_t passkey = 0; // passkey "000000"
         uint8_t  pairMode = GAPBOND_PAIRING_MODE_WAIT_FOR_REQ;
-        uint8_t  mitm = FALSE;
+        uint8_t  mitm = TRUE;
         uint8_t  bonding = TRUE;
-        uint8_t  ioCap = GAPBOND_IO_CAP_NO_INPUT_NO_OUTPUT;
+        uint8_t  ioCap = GAPBOND_IO_CAP_DISPLAY_ONLY;
+        uint8_t  keySize = 16;
+        uint8_t  scEnable = TRUE;
+        GAPBondMgr_SetParameter(GAPBOND_PERI_DEFAULT_PASSCODE, sizeof(uint32_t), &passkey);
         GAPBondMgr_SetParameter(GAPBOND_PERI_PAIRING_MODE, sizeof(uint8_t), &pairMode);
         GAPBondMgr_SetParameter(GAPBOND_PERI_MITM_PROTECTION, sizeof(uint8_t), &mitm);
         GAPBondMgr_SetParameter(GAPBOND_PERI_IO_CAPABILITIES, sizeof(uint8_t), &ioCap);
         GAPBondMgr_SetParameter(GAPBOND_PERI_BONDING_ENABLED, sizeof(uint8_t), &bonding);
-        RF_BondingErase();
-        PRINT("Bond records erased\n");
+        GAPBondMgr_SetParameter(GAPBOND_KEYSIZE, sizeof(uint8_t), &keySize);
+        GAPBondMgr_SetParameter(GAPBOND_PERI_SC_PROTECTION, sizeof(uint8_t), &scEnable);
     }
 
     // Initialize GATT Client
@@ -283,6 +323,7 @@ void peripheral_ancs_client_init(void)
 
     // Set the GAP Characteristics
     GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
+    GGS_SetParameter(GGS_APPEARANCE_ATT, sizeof(gapAppearance), &gapAppearance);
 
     // Setup a delayed profile startup
     tmos_set_event(ancs_taskid, START_DEVICE_EVT);
@@ -327,12 +368,24 @@ uint16_t ANCS_ProcessEvent(uint8_t task_id, uint16_t events)
     if(events & START_SUBSCRIPE_NOTIDATA_EVT)
     {
         int err ;
+
+        if(ancs_write_pending != ANCS_WRITE_NONE)
+        {
+            tmos_start_task(ancs_taskid, START_SUBSCRIPE_NOTIDATA_EVT,
+                            MS1_TO_SYSTEM_TIME(100));
+            return (events ^ START_SUBSCRIPE_NOTIDATA_EVT);
+        }
+
         PRINT("  [ANCSC] sub DS ccc=0x%X\n", ancs_c.handle_ds_ccc);
+        ancs_write_pending = ANCS_WRITE_DS_CCCD;
         if((err = bt_ancs_subscribe_data_source(&ancs_c,
                 bt_ancs_subscribe->data_source)) != SUCCESS){
+            ancs_write_pending = ANCS_WRITE_NONE;
             PRINT("  [ANCSC] sub DS failed err=%d\n", err);
             if(err != -EALREADY)
                 tmos_start_task(ancs_taskid, START_SUBSCRIPE_NOTIDATA_EVT, MS1_TO_SYSTEM_TIME(100));
+            else
+                tmos_set_event(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT);
         }
         return (events ^ START_SUBSCRIPE_NOTIDATA_EVT);
     }
@@ -340,8 +393,20 @@ uint16_t ANCS_ProcessEvent(uint8_t task_id, uint16_t events)
     if(events & START_SUBSCRIPE_NOTISRC_EVT)
     {
         int err ;
+
+        if(ancs_write_pending != ANCS_WRITE_NONE)
+        {
+            tmos_start_task(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT,
+                            MS1_TO_SYSTEM_TIME(100));
+            return (events ^ START_SUBSCRIPE_NOTISRC_EVT);
+        }
+
+        PRINT("  [ANCSC] sub NS ccc=0x%X\n", ancs_c.handle_ns_ccc);
+        ancs_write_pending = ANCS_WRITE_NS_CCCD;
         if((err = bt_ancs_subscribe_notification_source(&ancs_c,
                 bt_ancs_subscribe->notification_source)) != SUCCESS){
+            ancs_write_pending = ANCS_WRITE_NONE;
+            PRINT("  [ANCSC] sub NS failed err=%d\n", err);
             if(err != -EALREADY)
                 tmos_start_task(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT, MS1_TO_SYSTEM_TIME(100));
         }
@@ -367,6 +432,16 @@ uint16_t ANCS_ProcessEvent(uint8_t task_id, uint16_t events)
                            DEFAULT_UPDATE_CONN_TIMEOUT,
                            ancs_taskid);
         return (events ^ START_PARAM_UPDATE_EVT);
+    }
+
+    if(events & PAIRING_TRIGGER_EVT)
+    {
+        if(ancs_conn_list.connHandle != GAP_CONNHANDLE_INIT)
+        {
+            bStatus_t secReq = GAPBondMgr_PeriSecurityReq(ancs_conn_list.connHandle);
+            PRINT("Security request:%02X\n", secReq);
+        }
+        return (events ^ PAIRING_TRIGGER_EVT);
     }
 
     if(events & START_PHY_UPDATE_EVT)
@@ -444,23 +519,73 @@ static void AncsProcessGATTMsg(gattMsgEvent_t *pMsg)
              (pMsg->msg.errorRsp.reqOpcode == ATT_READ_REQ))){
 
     } else if (pMsg->method == ATT_WRITE_RSP) {
-        /* Write Response 成功，消息体为空，errCode 为 0 */
-        bt_ancs_write_cb write_cb;
+        /* ATT Write Response has no handle. The serialized CCCD state tells
+         * us whether this response belongs to a subscription or Control Point. */
+        if(ancs_write_pending == ANCS_WRITE_DS_CCCD)
+        {
+            ancs_write_pending = ANCS_WRITE_NONE;
+            PRINT("  [ANCSC] DS subscribed confirmed ccc=0x%X\n",
+                  ancs_c.handle_ds_ccc);
+            tmos_set_event(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT);
+        }
+        else if(ancs_write_pending == ANCS_WRITE_NS_CCCD)
+        {
+            ancs_write_pending = ANCS_WRITE_NONE;
+            PRINT("  [ANCSC] NS subscribed confirmed ccc=0x%X\n",
+                  ancs_c.handle_ns_ccc);
+        }
+        else if(atomic_test_bit(&ancs_c.state, ANCS_CP_WRITE_PENDING))
+        {
+            bt_ancs_write_cb write_cb = ancs_c.cp_write_cb;
 
-        write_cb = ancs_c.cp_write_cb;
-        atomic_clear_bit(&ancs_c.state, ANCS_CP_WRITE_PENDING);
-        if (write_cb) {
-            write_cb(&ancs_c, 0);
+            atomic_clear_bit(&ancs_c.state, ANCS_CP_WRITE_PENDING);
+            if (write_cb) {
+                write_cb(&ancs_c, 0);
+            }
+        }
+        else
+        {
+            PRINT("  [ANCSC] unexpected write response\n");
         }
     } else if ((pMsg->method == ATT_ERROR_RSP) &&
              (pMsg->msg.errorRsp.reqOpcode == ATT_WRITE_REQ)){
-        /* 写请求失败，带 ATT 错误码 */
-        bt_ancs_write_cb write_cb;
+        uint16_t handle = pMsg->msg.errorRsp.handle;
+        uint8_t err = pMsg->msg.errorRsp.errCode;
 
-        write_cb = ancs_c.cp_write_cb;
-        atomic_clear_bit(&ancs_c.state, ANCS_CP_WRITE_PENDING);
-        if (write_cb) {
-            write_cb(&ancs_c, pMsg->msg.errorRsp.errCode);
+        if(ancs_write_pending == ANCS_WRITE_DS_CCCD ||
+           handle == ancs_c.handle_ds_ccc)
+        {
+            ancs_write_pending = ANCS_WRITE_NONE;
+            atomic_clear_bit(&ancs_c.state, ANCS_DS_NOTIF_ENABLED);
+            PRINT("  [ANCSC] DS subscribe error: ccc=0x%X err=0x%02X\n",
+                  handle, err);
+            tmos_start_task(ancs_taskid, START_SUBSCRIPE_NOTIDATA_EVT,
+                            MS1_TO_SYSTEM_TIME(500));
+        }
+        else if(ancs_write_pending == ANCS_WRITE_NS_CCCD ||
+                handle == ancs_c.handle_ns_ccc)
+        {
+            ancs_write_pending = ANCS_WRITE_NONE;
+            atomic_clear_bit(&ancs_c.state, ANCS_NS_NOTIF_ENABLED);
+            PRINT("  [ANCSC] NS subscribe error: ccc=0x%X err=0x%02X\n",
+                  handle, err);
+            tmos_start_task(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT,
+                            MS1_TO_SYSTEM_TIME(500));
+        }
+        else if(handle == ancs_c.handle_cp &&
+                atomic_test_bit(&ancs_c.state, ANCS_CP_WRITE_PENDING))
+        {
+            bt_ancs_write_cb write_cb = ancs_c.cp_write_cb;
+
+            atomic_clear_bit(&ancs_c.state, ANCS_CP_WRITE_PENDING);
+            if (write_cb) {
+                write_cb(&ancs_c, err);
+            }
+        }
+        else
+        {
+            PRINT("  [ANCSC] write error: handle=0x%X err=0x%02X\n",
+                  handle, err);
         }
     } else if(pMsg->method == ATT_ERROR_RSP){
         PRINT("response %#x error: %#x\n", pMsg->msg.errorRsp.reqOpcode,
@@ -516,8 +641,14 @@ static void Peripheral_LinkEstablished(gapRoleEvent_t *pEvent)
         ancs_conn_list.connTimeout = event->connTimeout;
 
         ancs_c.conn = ancs_conn_list.connHandle;
+        ancs_write_pending = ANCS_WRITE_NONE;
         atomic_set_bit(&ancs_c.state, ANCS_BT_CONNECTED);
         ancs_ble_connected = 1;
+        EPD_UpdateClockBluetoothIcon(1);
+
+        // Ask the phone to move into an authenticated/bonded session early.
+        tmos_start_task(ancs_taskid, PAIRING_TRIGGER_EVT,
+                        MS1_TO_SYSTEM_TIME(DEFAULT_SECURITY_REQ_DELAY_MS));
 
         // Set timer for param update event
         tmos_start_task(ancs_taskid, START_PARAM_UPDATE_EVT, DEFAULT_PARAM_UPDATE_DELAY);
@@ -546,6 +677,11 @@ static void Peripheral_LinkTerminated(gapRoleEvent_t *pEvent)
     {
         pending_passcode_valid = 0;
         ancs_ble_connected = 0;
+        EPD_UpdateClockBluetoothIcon(0);
+        ancs_write_pending = ANCS_WRITE_NONE;
+        tmos_stop_task(ancs_taskid, PAIRING_TRIGGER_EVT);
+        tmos_stop_task(ancs_taskid, START_SUBSCRIPE_NOTIDATA_EVT);
+        tmos_stop_task(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT);
         ancs_conn_list.connHandle = GAP_CONNHANDLE_INIT;
         ancs_conn_list.connInterval = 0;
         ancs_conn_list.connSlaveLatency = 0;
@@ -604,6 +740,7 @@ static void AncsStateNotificationCB(gapRole_States_t newState, gapRoleEvent_t *p
                 tmos_stop_task(ancs_taskid, PASSCODE_DISPLAY_EVT);
                 EPD_SetOverlayLock(0);
                 ancs_ble_connected = 0;
+                EPD_UpdateClockBluetoothIcon(0);
                 PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
                 PRINT("Advertising..\n");
             }
@@ -640,6 +777,7 @@ static void AncsStateNotificationCB(gapRole_States_t newState, gapRoleEvent_t *p
                 tmos_stop_task(ancs_taskid, PASSCODE_DISPLAY_EVT);
                 EPD_SetOverlayLock(0);
                 ancs_ble_connected = 0;
+                EPD_UpdateClockBluetoothIcon(0);
                 PRINT("Disconnected.. Reason:%x\n", pEvent->linkTerminate.reason);
             }
             else if(pEvent->gap.opcode == GAP_LINK_ESTABLISHED_EVENT)
@@ -682,6 +820,7 @@ static void AncsPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status)
         ancs_pairing_success_refresh_pending = 0;
         tmos_stop_task(ancs_taskid, PAIRING_SUCCESS_RESTORE_EVT);
         pending_pairing_success_valid = 0;
+        tmos_stop_task(ancs_taskid, PAIRING_TRIGGER_EVT);
         PRINT("Pairing started:%d\n", status);
     }
     else if(state == GAPBOND_PAIRING_STATE_COMPLETE)
@@ -691,6 +830,7 @@ static void AncsPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status)
             pending_passcode_valid = 0;
             tmos_stop_task(ancs_taskid, PASSCODE_DISPLAY_EVT);
             tmos_stop_task(ancs_taskid, PAIRING_SUCCESS_RESTORE_EVT);
+            tmos_stop_task(ancs_taskid, PAIRING_TRIGGER_EVT);
             pending_pairing_success_valid = 1;
             tmos_set_event(ancs_taskid, PAIRING_SUCCESS_DISPLAY_EVT);
             PRINT("Pairing success\n");
@@ -700,6 +840,7 @@ static void AncsPairStateCB(uint16_t connHandle, uint8_t state, uint8_t status)
             pending_passcode_valid = 0;
             tmos_stop_task(ancs_taskid, PASSCODE_DISPLAY_EVT);
             tmos_stop_task(ancs_taskid, PAIRING_SUCCESS_RESTORE_EVT);
+            tmos_stop_task(ancs_taskid, PAIRING_TRIGGER_EVT);
             pending_pairing_success_valid = 0;
             ancs_pairing_success_refresh_pending = 0;
             EPD_SetOverlayLock(0);
@@ -782,20 +923,19 @@ static void AncsPasscodeCB(uint8_t *deviceAddr, uint16_t connectionHandle,
 static void AncsApp_discoverService(gattMsgEvent_t *pMsg)
 {
 
-    static uint16_t Ancs_svcStartHdl;
-    static uint16_t Ancs_svcEndHdl;
-    static uint8_t Ancs_endHdlIdx;
-    static uint8_t isNotifCCCD = FALSE;
-
     switch (discoveryState)
     {
       case DISC_ANCS_START:
         {
           uint8_t uuid[ATT_UUID_SIZE] = {ANCS_SVC_UUID};
 
-          // Initialize service discovery variables
+          /* 每次连接都从干净状态开始发现。句柄缓存必须清空：残留上一次连接的
+           * 句柄会让 CCCD 发现被跳过（判断条件是 cache == 0），订阅于是写入
+           * 句柄 0 得到 ATT_ERR_INVALID_HANDLE，并在重试里死循环。 */
+          tmos_memset(Ancs_handleCache, 0, sizeof(Ancs_handleCache));
           Ancs_svcStartHdl = Ancs_svcEndHdl = 0;
           Ancs_endHdlIdx = 0;
+          isNotifCCCD = FALSE;
 
           // Discover ANCS service by UUID
           GATT_DiscPrimaryServiceByUUID(ancs_c.conn, uuid,
@@ -1011,7 +1151,6 @@ static void AncsApp_discoverService(gattMsgEvent_t *pMsg)
                   ancs_c.handle_cp, ancs_c.handle_ns, ancs_c.handle_ns_ccc,
                   ancs_c.handle_ds, ancs_c.handle_ds_ccc);
               tmos_set_event(ancs_taskid, START_SUBSCRIPE_NOTIDATA_EVT);
-              tmos_set_event(ancs_taskid, START_SUBSCRIPE_NOTISRC_EVT);
 
             }
           }
