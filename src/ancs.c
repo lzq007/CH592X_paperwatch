@@ -105,8 +105,8 @@ struct bt_ancs_client ancs_c;
 
 // GAP - SCAN RSP data (max size = 31 bytes)
 static uint8_t scanRspData[] = {
-    // complete name
-    0x09, // length of this data
+    // complete name：长度 0x0E = 1(type) + 13(名字)，后 4 位在运行时由 MAC 覆盖
+    0x0E, // length of this data
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
     'F',
     'J',
@@ -116,6 +116,11 @@ static uint8_t scanRspData[] = {
     'T',
     'C',
     'H',
+    '-',
+    '0',
+    '0',
+    '0',
+    '0',
 
     // connection interval range
     0x05, // length of this data
@@ -151,12 +156,10 @@ static uint8_t advertData[] = {
     GAP_ADTYPE_SERVICES_LIST_128BIT,
     ANCS_SVC_UUID,
 
-    // Keep the complete name in the primary advertisement because iOS may
-    // skip active scanning and therefore not receive the scan response.
-    // 名称占 10 字节后广播包正好 31 字节，时间同步服务 UUID 不再广播
-    // （手机连接后通过服务发现获取，不依赖广播内容）。
+    // 主广播已满 31 字节：这里只放短名保证 iOS 免 active scan 也能认到设备，
+    // 带 MAC 后缀的完整名放在扫描响应里（见 BuildDeviceName）。
     0x09,
-    GAP_ADTYPE_LOCAL_NAME_COMPLETE,
+    GAP_ADTYPE_LOCAL_NAME_SHORT,
     'F', 'J', ' ', 'W', 'A', 'T', 'C', 'H',
 };
 
@@ -182,11 +185,47 @@ static uint8_t isNotifCCCD = FALSE;
 static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "FJ WATCH";
 static uint16_t gapAppearance = GAP_APPEARE_GENERIC_WATCH;
 
+// 扫描响应里完整名的 MAC 后缀首字节下标：2(长度+类型) + "FJ WATCH-" 的 9 个字符
+#define SCAN_RSP_SUFFIX_IDX        11
 
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
 uint16_t ANCS_ProcessEvent(uint8_t task_id, uint16_t events);
+
+/* 用芯片 MAC 的低两字节生成唯一后缀，让同固件的多台设备区分得开。
+ * 后缀同时写入扫描响应和 GATT 设备名，保证两条路径读到的名字一致。 */
+static void BuildDeviceName(void)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    // GetMACAddress 底层读 Flash，要求缓冲区在 RAM 内且 4 字节对齐
+    __attribute__((aligned(4))) uint8_t mac[6] = {0};
+
+    if(GetMACAddress(mac) != SUCCESS)
+    {
+        // 读不到 MAC 时保留占位后缀，避免广播名出现乱码
+        PRINT("GetMACAddress failed, keep default suffix\n");
+        return;
+    }
+
+    // MacAddr 为小端：mac[0]/mac[1] 是 MAC 打印形式的最后两个字节
+    scanRspData[SCAN_RSP_SUFFIX_IDX + 0] = (uint8_t)hex[(mac[0] >> 4) & 0x0F];
+    scanRspData[SCAN_RSP_SUFFIX_IDX + 1] = (uint8_t)hex[mac[0] & 0x0F];
+    scanRspData[SCAN_RSP_SUFFIX_IDX + 2] = (uint8_t)hex[(mac[1] >> 4) & 0x0F];
+    scanRspData[SCAN_RSP_SUFFIX_IDX + 3] = (uint8_t)hex[mac[1] & 0x0F];
+
+    memset(attDeviceName, 0, GAP_DEVICE_NAME_LEN);
+    memcpy(attDeviceName, "FJ WATCH-", 9);
+    attDeviceName[9]  = hex[(mac[0] >> 4) & 0x0F];
+    attDeviceName[10] = hex[mac[0] & 0x0F];
+    attDeviceName[11] = hex[(mac[1] >> 4) & 0x0F];
+    attDeviceName[12] = hex[mac[1] & 0x0F];
+
+    PRINT("Device name: %s (MAC %02X:%02X:%02X:%02X:%02X:%02X)\n",
+          (char *)attDeviceName,
+          mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+}
+
 static void AncsProcessTMOSMsg(tmos_event_hdr_t *pMsg);
 static void AncsApp_discoverService(gattMsgEvent_t *pMsg);
 static void AncsStateNotificationCB(gapRole_States_t newState, gapRoleEvent_t *pEvent);
@@ -261,6 +300,9 @@ void peripheral_ancs_client_init(void)
 {
     ancs_taskid = TMOS_ProcessEventRegister(ANCS_ProcessEvent);
     ancs_ble_connected = 0;
+
+    // 广播数据在下面 GAPRole_SetParameter 时就被取走，名字必须在之前生成
+    BuildDeviceName();
 
     // Setup the GAP Peripheral Role Profile
     {
