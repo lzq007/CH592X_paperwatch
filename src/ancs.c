@@ -106,12 +106,16 @@ struct bt_ancs_client ancs_c;
 // GAP - SCAN RSP data (max size = 31 bytes)
 static uint8_t scanRspData[] = {
     // complete name
-    0x05, // length of this data
+    0x09, // length of this data
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
+    'F',
+    'J',
+    ' ',
+    'W',
     'A',
-    'N',
+    'T',
     'C',
-    'S',
+    'H',
 
     // connection interval range
     0x05, // length of this data
@@ -149,15 +153,11 @@ static uint8_t advertData[] = {
 
     // Keep the complete name in the primary advertisement because iOS may
     // skip active scanning and therefore not receive the scan response.
-    0x05,
+    // 名称占 10 字节后广播包正好 31 字节，时间同步服务 UUID 不再广播
+    // （手机连接后通过服务发现获取，不依赖广播内容）。
+    0x09,
     GAP_ADTYPE_LOCAL_NAME_COMPLETE,
-    'A', 'N', 'C', 'S',
-
-    // Advertise the primary service that this accessory actually hosts.
-    0x03,
-    GAP_ADTYPE_16BIT_COMPLETE,
-    LO_UINT16(TIME_SYNC_SERVICE_UUID),
-    HI_UINT16(TIME_SYNC_SERVICE_UUID),
+    'F', 'J', ' ', 'W', 'A', 'T', 'C', 'H',
 };
 
 
@@ -179,7 +179,7 @@ static uint8_t Ancs_endHdlIdx;
 static uint8_t isNotifCCCD = FALSE;
 
 // GAP GATT Attributes
-static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "ANCS";
+static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "FJ WATCH";
 static uint16_t gapAppearance = GAP_APPEARE_GENERIC_WATCH;
 
 

@@ -21,6 +21,7 @@
 #define BUZZER_SHORT_MS     100    /* 每声鸣响时长 */
 #define BUZZER_GAP_MS       120    /* 两声之间间隔 */
 #define BUZZER_TIMES        2      /* "滴滴"两声 */
+#define BUZZER_KEY_MS       30     /* 按键反馈单声时长（阻塞式，按下即响） */
 
 /* 蜂鸣器任务 ID */
 static tmosTaskID buzzerTaskID;
@@ -200,6 +201,27 @@ void BUZZER_NotifyBeep(void)
 uint8_t BUZZER_IsBeeping(void)
 {
     return buzzerActive;
+}
+
+/*******************************************************************************
+ * @fn      BUZZER_KeyBeep
+ *
+ * @brief   按键反馈：按下瞬间立即短鸣一声（阻塞约 30ms，不占用 TMOS 事件）
+ *
+ *          完成后主动关断 PWM，因此不会被随后 EPD 刷新开头的 BUZZER_Stop 截断，
+ *          也不会把 PWM 冻结在开启状态。30ms 远小于 100ms 的按键采样周期，
+ *          不会导致漏采按键。
+ *
+ * @param   None.
+ *
+ * @return  None.
+ *******************************************************************************/
+void BUZZER_KeyBeep(void)
+{
+    BUZZER_Stop();
+    PWMX_ACTOUT(BUZZER_PWM_CH, 128, High_Level, ENABLE);
+    DelayMs(BUZZER_KEY_MS);
+    PWMX_ACTOUT(BUZZER_PWM_CH, 128, High_Level, DISABLE);
 }
 
 /******************************** endfile @ BUZZER ******************************/

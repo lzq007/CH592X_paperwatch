@@ -38,6 +38,11 @@ static volatile uint8_t epd_force_full_refresh_once = 0;
 static uint8_t epd_bt_icon_target = 0;
 static uint8_t epd_bt_icon_rendered = 0;
 static volatile uint8_t epd_bt_icon_dirty = 0;
+/* 开机选择页：当前已呈现的高亮项，以及页面是否已整页绘制 */
+static uint8_t epd_boot_menu_highlight = 0;
+static uint8_t epd_boot_menu_drawn = 0;
+/* 设时页是否已整页绘制（之后只做数值区局刷） */
+static uint8_t epd_time_set_drawn = 0;
 
 static sFONT *EPD_font_app   = &Font16;
 static sFONT *EPD_font_title = &Font20;
@@ -94,6 +99,19 @@ static sFONT *EPD_font_body  = &Font16;
 #define EPD_STATUS_LABEL_Y  132
 #define EPD_STATUS_VALUE_Y  150
 #define EPD_STATUS_SINGLE_Y  142
+
+/* 开机选择页两个选项按钮的行高与间距 */
+#define BOOT_MENU_ROW_H      44
+#define BOOT_MENU_ROW_GAP    10
+#define BOOT_MENU_ROW0_Y     30
+#define BOOT_MENU_ROW1_Y     (BOOT_MENU_ROW0_Y + BOOT_MENU_ROW_H + BOOT_MENU_ROW_GAP)
+#define BOOT_MENU_BOX_X0     16
+#define BOOT_MENU_BOX_X1     (EPD_UI_W - 17)
+/* 高亮切换时的窗口局刷范围：字节列 2~21（像素 16~175），行 26~129 */
+#define BOOT_MENU_WIN_X      2
+#define BOOT_MENU_WIN_W      20
+#define BOOT_MENU_WIN_Y      26
+#define BOOT_MENU_WIN_H      104
 
 static void epd_fill_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1,
                           UWORD color)
@@ -682,12 +700,30 @@ static void epd_draw_centered_scaled_utf8(uint16_t y, const char *text,
     }
 }
 
+/* 等宽 ASCII 串按字宽计算后的居中起始 X */
+static uint16_t epd_scaled_text_x(const char *text, const sFONT *font, uint8_t scale)
+{
+    uint16_t text_w;
+
+    if(!text || !font || scale == 0)
+    {
+        return 0;
+    }
+
+    text_w = (uint16_t)(strlen(text) * font->Width * scale);
+    if(text_w >= Paint.Width)
+    {
+        return 0;
+    }
+
+    return (uint16_t)((Paint.Width - text_w) / 2);
+}
+
 static void epd_draw_scaled_string_centered(uint16_t y, const char *text,
                                             const sFONT *font, uint8_t scale,
                                             UWORD fg)
 {
     size_t len;
-    uint16_t text_w;
     uint16_t x;
     size_t i;
 
@@ -697,15 +733,7 @@ static void epd_draw_scaled_string_centered(uint16_t y, const char *text,
     }
 
     len = strlen(text);
-    text_w = (uint16_t)(len * font->Width * scale);
-    if(text_w >= Paint.Width)
-    {
-        x = 0;
-    }
-    else
-    {
-        x = (uint16_t)((Paint.Width - text_w) / 2);
-    }
+    x = epd_scaled_text_x(text, font, scale);
 
     for(i = 0; i < len; i++)
     {
@@ -765,12 +793,14 @@ void EPD_UpdateClockBluetoothIcon(uint8_t show)
 static void epd_refresh_frame(uint8_t force_full, uint8_t notify_buzzer)
 {
     if(epd_can_full_refresh() &&
-       (force_full || EPD_NOTIFICATION_STRONG_REFRESH))
+       (force_full || EPD_NOTIFICATION_STRONG_REFRESH ||
+        epd_force_full_refresh_once))
     {
         EPD_HW_Init_GUI();
         EPD_Display_Full_Sync(EPD_Image);
         epd_need_full = 0;
         epd_refresh_count = 0;
+        epd_force_full_refresh_once = 0;
     }
     else
     {
@@ -874,10 +904,13 @@ static void epd_show_clock_demo(const RX8010SJ_Time *time, uint8_t has_message,
     epd_draw_scaled_string_centered(clock_y, hhmm, EPD_CLOCK_FONT,
                                     EPD_CLOCK_SCALE, BLACK);
 
-    /* 本帧是否本应走全刷 */
+    /* 本帧是否本应走全刷。epd_force_full_refresh_once 是显式请求，必须能
+     * 单独触发全刷（例如蓝牙同步成功后从状态页切到时钟页，此时 BLE 已连接、
+     * epd_can_full_refresh() 为假，且调用方走的是 Partial 接口）。 */
     epd_needs_full = (uint8_t)((epd_can_full_refresh() ||
                                 epd_force_full_refresh_once) &&
                                (force_full || epd_need_full ||
+                                epd_force_full_refresh_once ||
                                 epd_refresh_count >= EPD_CLOCK_REFRESH_CNT));
 
     /* 移除蓝牙图标必须走局刷：全刷波形会把当前屏幕（含旧图标）当作新基准写入
@@ -888,13 +921,16 @@ static void epd_show_clock_demo(const RX8010SJ_Time *time, uint8_t has_message,
         epd_refresh_clock_frame(0);
         if(epd_needs_full)
         {
+            /* 推迟到下一帧：同时保留显式全刷请求，否则会被这一次局刷吃掉 */
             epd_need_full = 1;
+            epd_force_full_refresh_once = 1;
         }
     }
     else if(epd_needs_full)
     {
         EPD_Display_Full_Sync(EPD_Image);
         epd_refresh_clock_frame(1);
+        epd_force_full_refresh_once = 0;
     }
     else
     {
@@ -904,7 +940,6 @@ static void epd_show_clock_demo(const RX8010SJ_Time *time, uint8_t has_message,
 
     epd_bt_icon_rendered = epd_bt_icon_target;
     tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
-    epd_force_full_refresh_once = 0;
 }
 
 static void epd_show_sync_status_page(const char *text)
@@ -924,6 +959,22 @@ static void epd_show_sync_status_page(const char *text)
     epd_refresh_frame(1, 0);
 }
 
+/* 蓝牙同步等待页：状态文字上移，底部加一行"长按3返回"提示 */
+static void epd_show_sync_waiting_page(const char *text)
+{
+    BUZZER_Stop();
+    epd_overlay_lock = 1;
+
+    Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
+    Paint_SelectImage(EPD_Image);
+    Paint_Clear(WHITE);
+
+    epd_draw_centered_utf8(64, text, BLACK);
+    epd_draw_centered_utf8(140, "长按3返回", BLACK);
+
+    epd_refresh_frame(1, 0);
+}
+
 void EPD_Show_Init(void)
 {
     EPD_GPIO_Init();
@@ -938,6 +989,9 @@ void EPD_Show_Init(void)
     epd_bt_icon_target = 0;
     epd_bt_icon_rendered = 0;
     epd_bt_icon_dirty = 0;
+    epd_boot_menu_drawn = 0;
+    epd_boot_menu_highlight = 0;
+    epd_time_set_drawn = 0;
 }
 
 void EPD_SetOverlayLock(uint8_t locked)
@@ -1111,7 +1165,7 @@ void EPD_Show_BluetoothConnected(void)
 
 void EPD_Show_TimeSyncWaiting(void)
 {
-    epd_show_sync_status_page("等待蓝牙广播时间同步");
+    epd_show_sync_waiting_page("等待蓝牙广播时间同步");
 }
 
 void EPD_Show_TimeSyncSyncing(void)
@@ -1132,6 +1186,225 @@ void EPD_Show_TimeSyncFail(void)
 void EPD_Show_TimeSyncTimeout(void)
 {
     epd_show_sync_status_page("时间同步超时");
+}
+
+static void epd_draw_scaled_string_left(uint16_t x, uint16_t y, const char *text,
+                                        const sFONT *font, uint8_t scale,
+                                        UWORD fg)
+{
+    size_t i;
+
+    if(!text || !font || scale == 0)
+    {
+        return;
+    }
+
+    for(i = 0; text[i]; i++)
+    {
+        epd_draw_scaled_char((uint16_t)(x + i * font->Width * scale), y,
+                             text[i], font, scale, fg);
+    }
+}
+
+/* 绘制开机选择页的单个选项按钮：高亮项黑底白字，非高亮项白底黑框黑字 */
+static void epd_boot_menu_draw_row(uint8_t bt_highlight, uint8_t row)
+{
+    uint16_t row_y = row ? BOOT_MENU_ROW1_Y : BOOT_MENU_ROW0_Y;
+    uint16_t row_text_y = (uint16_t)(row_y + (BOOT_MENU_ROW_H - FONT_CN_H) / 2);
+    uint8_t active = (uint8_t)((row == 1) ? bt_highlight : !bt_highlight);
+    UWORD fg = active ? WHITE : BLACK;
+
+    Paint_DrawRectangle(BOOT_MENU_BOX_X0, row_y,
+                        BOOT_MENU_BOX_X1, (uint16_t)(row_y + BOOT_MENU_ROW_H - 1),
+                        BLACK, active ? DRAW_FILL_FULL : DRAW_FILL_EMPTY,
+                        DOT_PIXEL_1X1);
+
+    epd_draw_centered_utf8(row_text_y,
+                           (row == 0) ? "手动设定时间" : "蓝牙时间同步", fg);
+}
+
+/* 开机选择页：手动设定时间 / 蓝牙时间同步，高亮项用黑底白字反显。
+ * 首次绘制整页走全刷；仅高亮项变化时只重刷两个选项行区域（窗口局刷）。
+ * force_redraw=1 用于页面被其它覆盖层（配对码、连接成功）盖住后整页恢复。 */
+void EPD_Show_BootMenu(uint8_t bt_highlight, uint8_t force_redraw)
+{
+    uint8_t highlight = bt_highlight ? 1 : 0;
+    uint8_t row;
+
+    BUZZER_Stop();
+    epd_overlay_lock = 1;
+
+    if(!epd_boot_menu_drawn || force_redraw)
+    {
+        Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
+        Paint_SelectImage(EPD_Image);
+        Paint_Clear(WHITE);
+
+        epd_draw_centered_utf8(6, "时间设定", BLACK);
+
+        for(row = 0; row < 2; row++)
+        {
+            epd_boot_menu_draw_row(highlight, row);
+        }
+
+        epd_draw_centered_utf8(134, "键1/2选择 键3确认", BLACK);
+        epd_draw_centered_utf8(154, "长按3返回", BLACK);
+
+        epd_boot_menu_drawn = 1;
+        epd_boot_menu_highlight = highlight;
+        epd_refresh_frame(1, 0);
+        return;
+    }
+
+    if(highlight == epd_boot_menu_highlight)
+    {
+        return;
+    }
+
+    /* 只有高亮项切换：先把窗口区域清白（否则旧的黑底会留在帧缓存里，
+     * 失去高亮的行仍是黑的），再重画两个选项按钮，只刷新该矩形区域。
+     * 窗口按字节列对齐（像素 16~175），避开标题和底部提示文字。 */
+    Paint_SelectImage(EPD_Image);
+    Paint_ClearWindows(BOOT_MENU_WIN_X * 8, BOOT_MENU_WIN_Y,
+                       BOOT_MENU_WIN_X * 8 + BOOT_MENU_WIN_W * 8,
+                       BOOT_MENU_WIN_Y + BOOT_MENU_WIN_H, WHITE);
+    for(row = 0; row < 2; row++)
+    {
+        epd_boot_menu_draw_row(highlight, row);
+    }
+
+    EPD_HW_Init_GUI();
+    EPD_PartRefresh_Window(BOOT_MENU_WIN_X, BOOT_MENU_WIN_Y,
+                           EPD_Image, EPD_Image_prev,
+                           BOOT_MENU_WIN_W, BOOT_MENU_WIN_H);
+
+    tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
+    epd_boot_menu_highlight = highlight;
+    epd_refresh_count++;
+}
+
+/* 设时页数值区窗口：只刷新日期/时间/下划线，不动标题和底部提示。
+ * 像素 x 41~151 → 字节列 4~20；行 40~108 覆盖两行文字与下划线。 */
+#define TIME_SET_WIN_X      4
+#define TIME_SET_WIN_W      17
+#define TIME_SET_WIN_Y      40
+#define TIME_SET_WIN_H      69
+
+/* 只画数值区（日期、时间、当前字段下划线），调用方负责选好画布 */
+static void epd_time_set_draw_values(const RX8010SJ_Time *time, uint8_t field)
+{
+    uint16_t date_y = 44;
+    uint16_t time_y = 66;
+    uint16_t date_x;
+    uint16_t time_x;
+    uint16_t ul_x0;
+    uint16_t ul_x1;
+    uint16_t ul_y;
+    char date_str[16];
+    char time_str[8];
+
+    snprintf(date_str, sizeof(date_str), "%04u-%02u-%02u",
+             (unsigned int)time->year, (unsigned int)time->month,
+             (unsigned int)time->day);
+    snprintf(time_str, sizeof(time_str), "%02u:%02u",
+             (unsigned int)time->hour, (unsigned int)time->minute);
+
+    /* 日期行与时间行都按各自文本宽度居中，下划线跟随居中后的字符位置 */
+    date_x = epd_scaled_text_x(date_str, &Font16, 1);
+    time_x = epd_scaled_text_x(time_str, &Font16, 2);
+
+    epd_draw_scaled_string_left(date_x, date_y, date_str, &Font16, 1, BLACK);
+    epd_draw_scaled_string_left(time_x, time_y, time_str, &Font16, 2, BLACK);
+
+    /* 按字段换算下划线位置：日期行字号 1，时间行字号 2 */
+    switch(field)
+    {
+    case EPD_TS_YEAR:
+        ul_x0 = date_x;
+        ul_x1 = (uint16_t)(date_x + Font16.Width * 4);
+        ul_y = (uint16_t)(date_y + Font16.Height + 2);
+        break;
+    case EPD_TS_MONTH:
+        ul_x0 = (uint16_t)(date_x + Font16.Width * 5);
+        ul_x1 = (uint16_t)(date_x + Font16.Width * 7 - 1);
+        ul_y = (uint16_t)(date_y + Font16.Height + 2);
+        break;
+    case EPD_TS_DAY:
+        ul_x0 = (uint16_t)(date_x + Font16.Width * 8);
+        ul_x1 = (uint16_t)(date_x + Font16.Width * 10 - 1);
+        ul_y = (uint16_t)(date_y + Font16.Height + 2);
+        break;
+    case EPD_TS_HOUR:
+        ul_x0 = time_x;
+        ul_x1 = (uint16_t)(time_x + Font16.Width * 2 * 2 - 1);
+        ul_y = (uint16_t)(time_y + Font16.Height * 2 + 2);
+        break;
+    default:
+        ul_x0 = (uint16_t)(time_x + Font16.Width * 2 * 3);
+        ul_x1 = (uint16_t)(time_x + Font16.Width * 2 * 5 - 1);
+        ul_y = (uint16_t)(time_y + Font16.Height * 2 + 2);
+        break;
+    }
+
+    epd_fill_rect(ul_x0, ul_y, ul_x1, (uint16_t)(ul_y + 2), BLACK);
+}
+
+/* 手动设时页：逐项调整，当前项下方画一条粗下划线。
+ * 首次进入整页绘制；之后调整数值只做数值区窗口局刷，缩短阻塞时间。 */
+void EPD_Show_TimeSet(const RX8010SJ_Time *time, uint8_t field)
+{
+    if(!time)
+    {
+        return;
+    }
+
+    BUZZER_Stop();
+    epd_overlay_lock = 1;
+
+    if(!epd_time_set_drawn)
+    {
+        Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
+        Paint_SelectImage(EPD_Image);
+        Paint_Clear(WHITE);
+
+        epd_draw_centered_utf8(12, "时间设定", BLACK);
+        epd_time_set_draw_values(time, field);
+        epd_draw_centered_utf8(124, "键1减 键2加 键3确认", BLACK);
+        epd_draw_centered_utf8(146, "长按3返回", BLACK);
+
+        epd_time_set_drawn = 1;
+        epd_refresh_frame(0, 0);
+        return;
+    }
+
+    /* 仅数值变化：清窗口后重画数值区，局部刷新 */
+    Paint_SelectImage(EPD_Image);
+    Paint_ClearWindows(TIME_SET_WIN_X * 8, TIME_SET_WIN_Y,
+                       TIME_SET_WIN_X * 8 + TIME_SET_WIN_W * 8,
+                       TIME_SET_WIN_Y + TIME_SET_WIN_H, WHITE);
+    epd_time_set_draw_values(time, field);
+
+    EPD_HW_Init_GUI();
+    EPD_PartRefresh_Window(TIME_SET_WIN_X, TIME_SET_WIN_Y,
+                           EPD_Image, EPD_Image_prev,
+                           TIME_SET_WIN_W, TIME_SET_WIN_H);
+
+    /* 显式全刷请求已由本次局刷消费 */
+    tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
+    epd_force_full_refresh_once = 0;
+    epd_refresh_count++;
+}
+
+void EPD_Show_TimeSetFail(void)
+{
+    epd_show_sync_status_page("保存时间失败");
+}
+
+/* 离开设时页后调用：下次进入必须整页重绘。否则增量窗口局刷只覆盖数值区，
+ * 上一页（选择页/时钟页）的内容会残留在窗口之外。 */
+void EPD_TimeSet_Invalidate(void)
+{
+    epd_time_set_drawn = 0;
 }
 
 void EPD_RequestFullRefreshOnce(void)

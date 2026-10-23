@@ -116,13 +116,17 @@ static const char *lit_appid[BT_ANCS_APP_ATTR_COUNT] = { "Display Name" };
 #define CLOCK_TICK_EVT          0x0002
 #define TIME_SYNC_RESTORE_EVT   0x0008
 #define NOTIFICATION_ICON_EVT   0x0010
+#define TIME_SET_RESTORE_EVT    0x0020
+#define UI_APPLY_EVT            0x0040
 
 #define TIME_SYNC_STATUS_MS      1500
 
 typedef enum
 {
-    APP_SCREEN_CLOCK = 0,
-    APP_SCREEN_NOTIFICATION_DETAIL = 1,
+    APP_SCREEN_BOOT_MENU = 0,
+    APP_SCREEN_TIME_SET = 1,
+    APP_SCREEN_CLOCK = 2,
+    APP_SCREEN_NOTIFICATION_DETAIL = 3,
 } app_screen_t;
 
 static tmosTaskID appTaskID;
@@ -130,7 +134,12 @@ static volatile uint8_t clock_force_refresh = 1;
 static volatile uint8_t clock_force_partial_once = 0;
 static volatile uint8_t clock_refresh_blocked = 0;
 static volatile uint8_t notification_beep_pending = 0;
-static app_screen_t app_screen = APP_SCREEN_CLOCK;
+static app_screen_t app_screen = APP_SCREEN_BOOT_MENU;
+/* 开机选择页当前高亮项：0=手动设定时间，1=蓝牙时间同步 */
+static uint8_t boot_menu_bt_highlight = 0;
+/* 手动设时：可编辑副本 + 当前字段（epd_timeset_field_t） */
+static RX8010SJ_Time time_set_value;
+static uint8_t time_set_field = 0;
 static uint8_t notification_unread = 0;
 static uint8_t notification_pending_during_detail = 0;
 /* Removed 事件可能在覆盖层或详情页显示期间到达，延后到时钟界面清除图标。 */
@@ -227,7 +236,9 @@ static void clock_render(const RX8010SJ_Time *now)
  * 用于屏蔽通知提醒音：等待广播时间同步期间蜂鸣器不应鸣响。 */
 static uint8_t time_sync_ui_active(void)
 {
-    return (uint8_t)(time_sync_session_active ||
+    return (uint8_t)(app_screen == APP_SCREEN_BOOT_MENU ||
+                     app_screen == APP_SCREEN_TIME_SET ||
+                     time_sync_session_active ||
                      time_sync_restore_to_waiting ||
                      time_sync_status_visible);
 }
@@ -247,6 +258,7 @@ static void time_sync_show_clock(void)
 {
     RX8010SJ_Time now;
 
+    app_screen = APP_SCREEN_CLOCK;
     EPD_SetOverlayLock(0);
     time_sync_status_visible = 0;
     clock_refresh_blocked = 0;
@@ -267,6 +279,265 @@ static void time_sync_schedule_restore(uint8_t waiting)
     time_sync_restore_to_waiting = waiting ? 1 : 0;
     tmos_start_task(appTaskID, TIME_SYNC_RESTORE_EVT,
                     MS1_TO_SYSTEM_TIME(TIME_SYNC_STATUS_MS));
+}
+
+static uint8_t days_in_month(uint16_t year, uint8_t month)
+{
+    static const uint8_t days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+    if(month == 2 &&
+       ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+    {
+        return 29;
+    }
+
+    return days[(month >= 1 && month <= 12) ? (month - 1) : 0];
+}
+
+static void clock_print_time(const char *tag, const RX8010SJ_Time *t);
+
+/* 按键动作只改状态并置 pending，刷新统一在按键松开后做一次。
+ * 原因：e-paper 刷新是阻塞的（设时页整屏重绘可达数百毫秒），在回调里刷屏会
+ * 让 HAL_KeyPoll 在阻塞期间漏采按键，快速连按/长按都只能响应第一次。 */
+typedef enum
+{
+    UI_PENDING_NONE = 0,
+    UI_PENDING_BOOT_MENU,   /* 开机选择页高亮变化 */
+    UI_PENDING_TIME_SET,    /* 设时页数值变化 / 切换字段 */
+    UI_PENDING_ENTER_TIME_SET,
+    UI_PENDING_SAVE_TIME,
+} ui_pending_t;
+
+#define TIME_SET_REPEAT_FIRST_MS   500  /* 按住多久后开始连发 */
+#define TIME_SET_REPEAT_PERIOD_MS  150  /* 连发间隔 */
+#define KEY3_LONG_PRESS_MS         1200 /* 键3 长按多久返回时间设定选择页 */
+
+static volatile uint8_t ui_pending = UI_PENDING_NONE;
+/* 按键跟踪：上一轮采样到的按键位、下一次连发时刻、键3 长按起点 */
+static uint8_t key_last_keys;
+static uint32_t key_repeat_time;
+static uint32_t key3_long_start;
+static uint8_t key3_long_fired;
+
+static void time_set_render(void)
+{
+    EPD_Show_TimeSet(&time_set_value, time_set_field);
+}
+
+/* force_redraw=1 时整页重绘（覆盖层盖住菜单后恢复），否则只做增量的高亮切换 */
+static void boot_menu_show(uint8_t force_redraw)
+{
+    app_screen = APP_SCREEN_BOOT_MENU;
+    EPD_SetOverlayLock(1);
+    EPD_Show_BootMenu(boot_menu_bt_highlight, force_redraw);
+}
+
+/* 长按键3 返回时间设定选择页：仅用于「手动设定时间」和「蓝牙同步等待」两个
+ * 页面。时钟页的键3 仍保留原来的调试输出。 */
+static uint8_t key3_return_to_menu_available(void)
+{
+    return (uint8_t)(app_screen == APP_SCREEN_TIME_SET ||
+                     (app_screen == APP_SCREEN_CLOCK && time_sync_ui_active()));
+}
+
+/* 返回选择页：关掉蓝牙同步窗口、取消挂起的恢复任务，并整页重绘菜单 */
+static void key3_return_to_menu(void)
+{
+    tmos_stop_task(appTaskID, TIME_SYNC_RESTORE_EVT);
+    tmos_stop_task(appTaskID, TIME_SET_RESTORE_EVT);
+    TimeSync_SetWindowOpen(0);
+    time_sync_session_active = 0;
+    time_sync_restore_to_waiting = 0;
+    time_sync_status_visible = 0;
+    clock_refresh_blocked = 0;
+    ui_pending = UI_PENDING_NONE;
+    /* 设时页下次进入必须整页重绘，否则选择页内容会残留在窗口之外 */
+    EPD_TimeSet_Invalidate();
+
+    BUZZER_KeyBeep();
+    boot_menu_show(1);
+}
+
+/* 「蓝牙时间同步」：进入原有的等待广播页面 */
+static void boot_enter_bt_sync(void)
+{
+    app_screen = APP_SCREEN_CLOCK;
+    EPD_TimeSet_Invalidate();
+    time_sync_begin_session();
+}
+
+/* 「手动设定时间」：以 RTC 当前时间（读不到则用编译时间）为初值进入编辑 */
+static void time_set_enter(void)
+{
+    RX8010SJ_Time now;
+
+    if(RX8010SJ_ReadTime(&now))
+    {
+        time_set_value = now;
+    }
+    else if(clock_time_valid)
+    {
+        time_set_value = clock_time_last;
+        time_set_value.second = 0;
+    }
+    else
+    {
+        /* RTC 不可读时的兜底初值，避免编辑到非法时间 */
+        time_set_value.year = 2026;
+        time_set_value.month = 1;
+        time_set_value.day = 1;
+        time_set_value.hour = 12;
+        time_set_value.minute = 0;
+        time_set_value.second = 0;
+        time_set_value.weekday = 4;
+    }
+
+    time_set_field = EPD_TS_YEAR;
+    app_screen = APP_SCREEN_TIME_SET;
+    /* 从选择页整屏切换到设时页，走一次全刷避免大面积残影 */
+    EPD_RequestFullRefreshOnce();
+    ui_pending = UI_PENDING_ENTER_TIME_SET;
+}
+
+static void time_set_adjust(int8_t delta)
+{
+    RX8010SJ_Time *t = &time_set_value;
+
+    switch(time_set_field)
+    {
+    case EPD_TS_YEAR:
+        t->year = (uint16_t)(t->year + delta);
+        if(t->year < 2000) t->year = 2099;
+        if(t->year > 2099) t->year = 2000;
+        break;
+    case EPD_TS_MONTH:
+        t->month = (uint8_t)(t->month + delta);
+        if(t->month < 1) t->month = 12;
+        if(t->month > 12) t->month = 1;
+        break;
+    case EPD_TS_DAY:
+    {
+        uint8_t last = days_in_month(t->year, t->month);
+        t->day = (uint8_t)(t->day + delta);
+        if(t->day < 1) t->day = last;
+        if(t->day > last) t->day = 1;
+        break;
+    }
+    case EPD_TS_HOUR:
+        if(delta > 0)
+        {
+            t->hour = (uint8_t)((t->hour + 1) % 24);
+        }
+        else
+        {
+            t->hour = (uint8_t)((t->hour == 0) ? 23 : (t->hour - 1));
+        }
+        break;
+    default:
+        if(delta > 0)
+        {
+            t->minute = (uint8_t)((t->minute + 1) % 60);
+        }
+        else
+        {
+            t->minute = (uint8_t)((t->minute == 0) ? 59 : (t->minute - 1));
+        }
+        break;
+    }
+
+    ui_pending = UI_PENDING_TIME_SET;
+}
+
+static void time_set_confirm(void)
+{
+    if(time_set_field < EPD_TS_MINUTE)
+    {
+        time_set_field++;
+        /* 只重绘数值区（窗口局刷，很快），阻塞时间短到不会漏采下一次按键 */
+        time_set_render();
+        return;
+    }
+
+    ui_pending = UI_PENDING_SAVE_TIME;
+}
+
+/* 设时页的统一刷新：数值/字段变化做窗口局刷，保存时整页刷 + 写 RTC */
+static void time_set_apply_pending(void)
+{
+    RX8010SJ_Time verify;
+    static const uint8_t month_offset[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    uint16_t weekday_year;
+
+    if(ui_pending == UI_PENDING_ENTER_TIME_SET)
+    {
+        ui_pending = UI_PENDING_NONE;
+        time_set_render();
+        return;
+    }
+
+    if(ui_pending != UI_PENDING_SAVE_TIME)
+    {
+        ui_pending = UI_PENDING_NONE;
+        time_set_render();
+        return;
+    }
+
+    ui_pending = UI_PENDING_NONE;
+
+    /* 写入前由年月日重新推算星期，避免编辑日期后星期错位 */
+    weekday_year = time_set_value.year;
+    if(time_set_value.month < 3)
+    {
+        weekday_year--;
+    }
+    time_set_value.weekday = (uint8_t)((weekday_year + weekday_year / 4 -
+                                       weekday_year / 100 + weekday_year / 400 +
+                                       month_offset[time_set_value.month - 1] +
+                                       time_set_value.day) % 7);
+    time_set_value.second = 0;
+
+    if(!RX8010SJ_SetTime(&time_set_value))
+    {
+        EPD_Show_TimeSetFail();
+        tmos_start_task(appTaskID, TIME_SET_RESTORE_EVT,
+                        MS1_TO_SYSTEM_TIME(TIME_SYNC_STATUS_MS));
+        return;
+    }
+
+    RX8010SJ_ReadTime(&verify);
+    clock_print_time("[timeset] set ", &time_set_value);
+    clock_print_time("[timeset] rtc ", &verify);
+    clock_time_last = time_set_value;
+    clock_time_valid = 1;
+    clock_force_refresh = 1;
+    clock_error_shown = 0;
+
+    app_screen = APP_SCREEN_CLOCK;
+    EPD_TimeSet_Invalidate();
+    time_sync_show_clock();
+}
+
+/* 统一处理待刷新项；只在按键全部松开且本轮无待处理刷新时调用，
+ * 避免刷屏期间漏采按键。 */
+static void ui_apply_pending(void)
+{
+    if(ui_pending == UI_PENDING_NONE)
+    {
+        return;
+    }
+
+    if(app_screen == APP_SCREEN_TIME_SET)
+    {
+        time_set_apply_pending();
+    }
+    else
+    {
+        ui_pending = UI_PENDING_NONE;
+        if(app_screen == APP_SCREEN_BOOT_MENU)
+        {
+            boot_menu_show(0);
+        }
+    }
 }
 
 /* 常见 App 包名 → 中文名映射表（因 Display Name 请求会打断通知属性回传，改用映射表） */
@@ -503,15 +774,14 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
                     time_sync_schedule_restore(1);
                 }
             }
-            else if(req.type == TIME_SYNC_REQ_INVALID)
+            else if(req.type == TIME_SYNC_REQ_INVALID && time_sync_session_active)
             {
+                /* 只在蓝牙同步流程中提示；开机选择页/手动设时期间收到的
+                 * 非法写入直接丢弃，不抢占当前页面。 */
                 EPD_SetOverlayLock(1);
                 time_sync_status_visible = 1;
                 EPD_Show_TimeSyncFail();
-                if(time_sync_session_active)
-                {
-                    time_sync_schedule_restore(1);
-                }
+                time_sync_schedule_restore(1);
             }
         }
 
@@ -539,6 +809,72 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
         return events ^ TIME_SYNC_RESTORE_EVT;
     }
 
+    if (events & TIME_SET_RESTORE_EVT)
+    {
+        /* 写入失败提示结束后，恢复手动设时页继续编辑 */
+        if(app_screen == APP_SCREEN_TIME_SET)
+        {
+            EPD_SetOverlayLock(1);
+            time_set_render();
+        }
+
+        return events ^ TIME_SET_RESTORE_EVT;
+    }
+
+    if (events & UI_APPLY_EVT)
+    {
+        uint8_t keys = HalKeyRead();
+        uint32_t now_ms = get_current_time();
+
+        if (keys == 0)
+        {
+            /* HAL_KeyPoll 只在按下时回调，松开不会通知，这里清零上一轮按键状态，
+             * 否则再次按下同一个键会被误判为"一直按住"而不响应。 */
+            key_last_keys = 0;
+            key3_long_start = 0;
+            key3_long_fired = 0;
+            ui_apply_pending();
+            return events ^ UI_APPLY_EVT;
+        }
+
+        /* 键3 长按返回时间设定选择页。轮询周期 50ms，判定精度足够。 */
+        if (key3_return_to_menu_available() && (keys & HAL_KEY_SW_3))
+        {
+            if (!key3_long_fired)
+            {
+                if (key3_long_start == 0)
+                {
+                    key3_long_start = now_ms;
+                }
+                else if ((uint32_t)(now_ms - key3_long_start) >= KEY3_LONG_PRESS_MS)
+                {
+                    key3_long_fired = 1;
+                    key3_return_to_menu();
+                }
+            }
+        }
+        else
+        {
+            key3_long_start = 0;
+            key3_long_fired = 0;
+        }
+
+        /* 设时页长按连发：按住期间累计数值，但不刷屏（刷屏会阻塞、拖慢采样）。
+         * 松开后统一刷新一次，屏幕显示最终值。 */
+        if (app_screen == APP_SCREEN_TIME_SET &&
+            (keys & (HAL_KEY_SW_1 | HAL_KEY_SW_2)) &&
+            (int32_t)(now_ms - key_repeat_time) >= 0)
+        {
+            BUZZER_KeyBeep();
+            time_set_adjust((keys & HAL_KEY_SW_1) ? -1 : 1);
+            key_repeat_time = now_ms + TIME_SET_REPEAT_PERIOD_MS;
+        }
+
+        /* 仍有键按住：等松开再刷新，保证按键采样不被阻塞刷屏打断 */
+        tmos_start_task(appTaskID, UI_APPLY_EVT, MS1_TO_SYSTEM_TIME(50));
+        return events ^ UI_APPLY_EVT;
+    }
+
     if (events & CLOCK_TICK_EVT)
     {
         RX8010SJ_Time now;
@@ -547,6 +883,28 @@ static tmosEvents Main_ProcessEvent(tmosTaskID task_id, tmosEvents events)
          * 把"滴"声拉长。时钟最迟在鸣响结束后的下一轮 tick 补刷。 */
         if (BUZZER_IsBeeping())
         {
+            clock_tick_reschedule(NULL);
+            return events ^ CLOCK_TICK_EVT;
+        }
+
+        /* 开机选择页 / 手动设时页不参与时钟刷新，页面重绘由各自逻辑负责。
+         * 配对成功若发生在这两个页面上，只重绘当前页，不跳转到时钟页。 */
+        if (app_screen != APP_SCREEN_CLOCK)
+        {
+            if (ancs_pairing_success_refresh_pending)
+            {
+                ancs_pairing_success_refresh_pending = 0;
+                if (app_screen == APP_SCREEN_BOOT_MENU)
+                {
+                    /* 配对成功覆盖层刚撤下，必须整页重绘 */
+                    boot_menu_show(1);
+                }
+                else
+                {
+                    EPD_SetOverlayLock(1);
+                    time_set_render();
+                }
+            }
             clock_tick_reschedule(NULL);
             return events ^ CLOCK_TICK_EVT;
         }
@@ -899,6 +1257,17 @@ struct key_state {
 };
 
 /**
+ * 开机选择页：
+ *      key1: 高亮「手动设定时间」。
+ *      key2: 高亮「蓝牙时间同步」。
+ *      key3: 进入当前高亮项。
+ *
+ * 手动设时页：
+ *      key1: 当前项 -1。
+ *      key2: 当前项 +1。
+ *      key3: 确认当前项并跳到下一项；分钟项确认时写入 RTC。
+ *
+ * 时钟页：
  * key1(PB22):
  *      single: request attributes for a notification.
  *      double: request attributes for a given app.
@@ -913,6 +1282,71 @@ void button_changed(uint8_t keys)
 {
     int err;
     static struct key_state k_s = {0};
+    /* 本轮回调中新按下的键（相对上一轮采样）。长按不会重复触发，
+     * 连发由 UI_APPLY_EVT 里的重复定时器负责。 */
+    uint8_t pressed = (uint8_t)(keys & (uint8_t)~key_last_keys);
+
+    key_last_keys = keys;
+
+    /* 开机选择页：键1/键2 切换高亮项，键3 进入当前高亮项。
+     * 动作只改状态，刷屏和按键提示音都交给 UI_APPLY_EVT 在松开后执行
+     * （EPD 刷新函数开头会 BUZZER_Stop，先响会被截断，听感忽长忽短）。 */
+    if(app_screen == APP_SCREEN_BOOT_MENU)
+    {
+        if(pressed & (HAL_KEY_SW_1 | HAL_KEY_SW_2))
+        {
+            BUZZER_KeyBeep();
+            boot_menu_bt_highlight = (pressed & HAL_KEY_SW_1) ? 0 : 1;
+            ui_pending = UI_PENDING_BOOT_MENU;
+        }
+        else if(pressed & HAL_KEY_SW_3)
+        {
+            BUZZER_KeyBeep();
+            if(boot_menu_bt_highlight)
+            {
+                boot_enter_bt_sync();
+            }
+            else
+            {
+                time_set_enter();
+            }
+        }
+
+        tmos_set_event(appTaskID, UI_APPLY_EVT);
+        return;
+    }
+
+    /* 手动设时页：键1 减、键2 加（按住连发），键3 确认当前项 / 保存进 RTC */
+    if(app_screen == APP_SCREEN_TIME_SET)
+    {
+        uint32_t current_time = get_current_time();
+
+        if(pressed & HAL_KEY_SW_1)
+        {
+            BUZZER_KeyBeep();
+            time_set_adjust(-1);
+            key_repeat_time = current_time + TIME_SET_REPEAT_FIRST_MS;
+        }
+        else if(pressed & HAL_KEY_SW_2)
+        {
+            BUZZER_KeyBeep();
+            time_set_adjust(1);
+            key_repeat_time = current_time + TIME_SET_REPEAT_FIRST_MS;
+        }
+
+        if(pressed & HAL_KEY_SW_3)
+        {
+            if(current_time - k_s.timestamp_key3 > 300)
+            {
+                BUZZER_KeyBeep();
+                time_set_confirm();
+            }
+            k_s.timestamp_key3 = current_time;
+        }
+
+        tmos_set_event(appTaskID, UI_APPLY_EVT);
+        return;
+    }
 
     if(keys & HAL_KEY_SW_1){
         uint32_t current_time = get_current_time();
@@ -985,6 +1419,13 @@ void button_changed(uint8_t keys)
         }
         k_s.timestamp_key3 = current_time;
     }
+
+    /* 蓝牙同步等待页没有增量刷新需求，但要支持长按 键3 返回选择页：
+     * 这里启动 UI_APPLY_EVT 的按住检测循环（松开后循环自行结束）。 */
+    if(key3_return_to_menu_available())
+    {
+        tmos_set_event(appTaskID, UI_APPLY_EVT);
+    }
 }
 
 /*********************************************************************
@@ -1047,14 +1488,16 @@ int main(void)
             PRINT("RX8010SJ time %04d-%02d-%02d %02d:%02d:%02d\n",
                   start_time.year, start_time.month, start_time.day,
                   start_time.hour, start_time.minute, start_time.second);
-            time_sync_begin_session();
         }
         else
         {
-            EPD_Show_Notification("Clock", "RX8010SJ", "RTC init fail");
+            /* 不再在初始化阶段覆盖屏幕：随后进入的开机选择页会接管显示 */
             clock_error_shown = 1;
             PRINT("RX8010SJ init fail\n");
         }
+
+        /* 每次上电先停在时间设定选择页：手动设时，或选择蓝牙同步 */
+        boot_menu_show(1);
 
         /* 时钟轮询改为一次性任务自我重排期（见 clock_tick_reschedule），
          * 以便在分钟翻转前切换成细粒度轮询、压掉显示滞后。 */

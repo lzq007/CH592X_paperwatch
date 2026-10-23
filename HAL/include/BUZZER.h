@@ -46,6 +46,11 @@ void BUZZER_Stop(void);
 void BUZZER_NotifyBeep(void);
 
 /**
+ * @brief   按键反馈：单声短鸣（约 40ms），独立于"滴滴"状态机
+ */
+void BUZZER_KeyBeep(void);
+
+/**
  * @brief   查询是否有鸣响序列正在进行（含静音间隔）
  *
  * @return  1=正在鸣响或间隔中，0=空闲
