@@ -185,6 +185,11 @@ static uint8_t isNotifCCCD = FALSE;
 static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "FJ WATCH";
 static uint16_t gapAppearance = GAP_APPEARE_GENERIC_WATCH;
 
+const char *Ancs_GetDeviceName(void)
+{
+    return (const char *)attDeviceName;
+}
+
 // 扫描响应里完整名的 MAC 后缀首字节下标：2(长度+类型) + "FJ WATCH-" 的 9 个字符
 #define SCAN_RSP_SUFFIX_IDX        11
 

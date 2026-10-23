@@ -15,6 +15,7 @@
 #include "HAL.h"
 #include "FONT_CN.h"
 #include "font_gb2312_16_thin.h"
+#include "ancs.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -959,9 +960,12 @@ static void epd_show_sync_status_page(const char *text)
     epd_refresh_frame(1, 0);
 }
 
-/* 蓝牙同步等待页：状态文字上移，底部加一行"长按3返回"提示 */
+/* 蓝牙同步等待页：状态文字上移，中间显示本机广播名，底部加一行"长按3返回"提示。
+ * 广播名带 MAC 后缀，同固件的多台设备同屏时也能确认手机该连哪一台。 */
 static void epd_show_sync_waiting_page(const char *text)
 {
+    const char *dev_name;
+
     BUZZER_Stop();
     epd_overlay_lock = 1;
 
@@ -969,7 +973,14 @@ static void epd_show_sync_waiting_page(const char *text)
     Paint_SelectImage(EPD_Image);
     Paint_Clear(WHITE);
 
-    epd_draw_centered_utf8(64, text, BLACK);
+    epd_draw_centered_utf8(48, text, BLACK);
+
+    dev_name = Ancs_GetDeviceName();
+    if(dev_name && *dev_name)
+    {
+        epd_draw_centered_scaled_utf8(88, dev_name, 1, BLACK);
+    }
+
     epd_draw_centered_utf8(140, "长按3返回", BLACK);
 
     epd_refresh_frame(1, 0);

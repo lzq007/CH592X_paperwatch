@@ -130,6 +130,9 @@ extern uint16_t Ancs_handleCache[HDL_CACHE_LEN];
  */
 void peripheral_ancs_client_init(void);
 
+/* 当前广播名（含 MAC 后缀），用于在其他界面展示，如等待同步页 */
+const char *Ancs_GetDeviceName(void);
+
 void ancs_subscribe_cb_register(struct bt_ancs_subscribe_cb *cb);
 
 /*********************************************************************
