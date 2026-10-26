@@ -140,6 +140,12 @@
           <input id="timeInput" type="datetime-local" step="1">
         </div>
       </div>
+      <div class="row">
+        <div>
+          <label for="offsetInput">同步补偿(ms，正值=让手表走得慢一点)</label>
+          <input id="offsetInput" type="number" step="10" value="0">
+        </div>
+      </div>
       <div class="actions">
         <button id="connectBtn" class="primary">连接设备</button>
         <button id="syncBtn" class="good" disabled>同步时间</button>
@@ -161,6 +167,7 @@
   <script>
     const SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
     const CHAR_UUID = '0000fff1-0000-1000-8000-00805f9b34fb';
+    const STATE_UUID = '0000fff2-0000-1000-8000-00805f9b34fb';
 
     const connectBtn = document.getElementById('connectBtn');
     const syncBtn = document.getElementById('syncBtn');
@@ -168,10 +175,12 @@
     const statusEl = document.getElementById('status');
     const packetEl = document.getElementById('packet');
     const timeInput = document.getElementById('timeInput');
+    const offsetInput = document.getElementById('offsetInput');
     const liveClock = document.getElementById('liveClock');
 
     let device = null;
     let characteristic = null;
+    let stateChar = null;
     const isSecureContextPage = window.isSecureContext;
 
     function pad(n) {
@@ -225,7 +234,8 @@
         if (isNaN(time.getTime())) {
           throw new Error('无效的网络时间');
         }
-        return time;
+        // 记录"这个时间是哪一刻拿到的"，发送前用经过的时间重新推算
+        return { time, at: performance.now() };
       } finally {
         clearTimeout(timer);
       }
@@ -309,6 +319,11 @@
         5000,
         '获取时间同步写入特征超时'
       );
+      try {
+        stateChar = await service.getCharacteristic(STATE_UUID);
+      } catch (err) {
+        stateChar = null;
+      }
       syncBtn.disabled = false;
       setStatus(`已连接到 ${device.name || '设备'}。`);
     }
@@ -318,21 +333,52 @@
         await connect();
       }
 
+      // 设备只有停在「等待蓝牙广播时间同步」页面时才接受写入，
+      // 先读状态特征确认，避免写入被拒绝却误以为成功。
+      if (stateChar) {
+        try {
+          const raw = await stateChar.readValue();
+          if (raw.byteLength > 0 && raw.getUint8(0) === 0) {
+            setStatus('设备当前不在「等待蓝牙广播时间同步」页面。\n请在手表上选择「蓝牙时间同步」后再试。', true);
+            return;
+          }
+        } catch (err) {
+          // 读不到状态就继续尝试写入，由写入结果兜底
+        }
+      }
+
       let chosen;
       try {
-        chosen = await getNetworkTime();
+        const ref = await getNetworkTime();
+        // 用手表侧"现在"重新推算：参考时刻 + 从取到参考时刻至今经过的时间
+        chosen = new Date(ref.time.getTime() + (performance.now() - ref.at));
         setStatus('已获取网络时间，正在发送...');
       } catch (err) {
         chosen = new Date(timeInput.value);
         setStatus('网络时间获取失败，改用页面当前时间发送...');
       }
-      const payload = buildPacket(chosen);
-      packetEl.textContent = packetText(payload) + `\n${formatDateTime(chosen)}`;
 
-      if (typeof characteristic.writeValueWithResponse === 'function') {
-        await characteristic.writeValueWithResponse(payload);
-      } else {
-        await characteristic.writeValue(payload);
+      // 可调补偿：RTC 只有整秒寄存器，写入只能落在整秒边界上
+      const offsetMs = Number(offsetInput.value) || 0;
+      if (offsetMs) {
+        chosen = new Date(chosen.getTime() + offsetMs);
+      }
+
+      const payload = buildPacket(chosen);
+      packetEl.textContent = packetText(payload) +
+        `\n${formatDateTime(chosen)} (补偿 ${offsetMs}ms)`;
+
+      try {
+        if (typeof characteristic.writeValueWithResponse === 'function') {
+          await characteristic.writeValueWithResponse(payload);
+        } else {
+          await characteristic.writeValue(payload);
+        }
+      } catch (err) {
+        // 设备拒绝写入（例如未停在「等待蓝牙广播时间同步」页面）
+        setStatus(`时间写入被设备拒绝：${err.message || err}\n` +
+                  '请先在手表上选择「蓝牙时间同步」，看到等待页面后再试。', true);
+        return;
       }
 
       setStatus(`时间已写入：${formatDateTime(chosen)}`);

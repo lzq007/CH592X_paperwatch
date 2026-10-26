@@ -12,6 +12,8 @@ extern "C" {
 
 #define TIME_SYNC_SERVICE_UUID        0xFFF0
 #define TIME_SYNC_CHAR_UUID           0xFFF1
+/* 只读状态特征：1=已进入等待蓝牙同步页面（可写入时间），0=不可写入 */
+#define TIME_SYNC_STATE_UUID          0xFFF2
 
 #define TIME_SYNC_PACKET_LEN          8
 

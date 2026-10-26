@@ -44,6 +44,14 @@ static uint8_t epd_boot_menu_highlight = 0;
 static uint8_t epd_boot_menu_drawn = 0;
 /* 设时页是否已整页绘制（之后只做数值区局刷） */
 static uint8_t epd_time_set_drawn = 0;
+/* 上一帧绘制的字段/编辑态，用于只重画真正变化的区域 */
+static uint8_t epd_time_set_last_field = 0xFF;
+static uint8_t epd_time_set_last_editing = 0xFF;
+static RX8010SJ_Time epd_time_set_last_time;
+/* 设置页：当前已呈现的选中项，以及是否已整页绘制 */
+static uint8_t epd_set_menu_sel = 0;
+static uint8_t epd_set_menu_buzzer = 1;
+static uint8_t epd_set_menu_drawn = 0;
 
 static sFONT *EPD_font_app   = &Font16;
 static sFONT *EPD_font_title = &Font20;
@@ -114,9 +122,26 @@ static sFONT *EPD_font_body  = &Font16;
 #define BOOT_MENU_WIN_Y      26
 #define BOOT_MENU_WIN_H      104
 
+/* 设置页三个选项的行高/间距（比开机页更紧，容纳三行） */
+#define SET_MENU_ROW_H       34
+#define SET_MENU_ROW_GAP     6
+#define SET_MENU_ROW0_Y      28
+#define SET_MENU_NUM_ROWS    3
+/* 高亮切换的窗口局刷范围：像素 16~175、行 24~143
+ * 三行按钮实际覆盖 28..141，留 2px 余量避免边缘残影 */
+#define SET_MENU_WIN_X       2
+#define SET_MENU_WIN_W       20
+#define SET_MENU_WIN_Y       24
+#define SET_MENU_WIN_H       120
+
+/* 设时页底部「返回 / 保存」按钮：分别贴左下角与右下角 */
+#define TIME_SET_BTN_W       58
+#define TIME_SET_BTN_H       34
+#define TIME_SET_BTN_Y       114
+#define TIME_SET_BTN_MARGIN  8
+
 static void epd_fill_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1,
-                          UWORD color)
-{
+                          UWORD color){
     uint16_t x;
     uint16_t y;
 
@@ -318,6 +343,34 @@ static void epd_draw_centered_utf8(uint16_t y, const char *text, UWORD fg)
     else
     {
         x = (uint16_t)((Paint.Width - text_w) / 2);
+    }
+
+    FONT_CN_DrawString(x, y, text, fg, 0);
+}
+
+/* 在 [x0,x1] 区间内水平居中绘制文本（用于按钮内的文字） */
+static void epd_draw_centered_utf8_rect(uint16_t x0, uint16_t x1, uint16_t y,
+                                        const char *text, UWORD fg)
+{
+    uint16_t text_w;
+    uint16_t center;
+    uint16_t x;
+
+    if(!text || !*text)
+    {
+        return;
+    }
+
+    text_w = epd_measure_utf8_width(text);
+    center = (uint16_t)((x0 + x1) / 2);
+
+    if(text_w >= center)
+    {
+        x = 0;
+    }
+    else
+    {
+        x = (uint16_t)(center - text_w / 2);
     }
 
     FONT_CN_DrawString(x, y, text, fg, 0);
@@ -1294,25 +1347,93 @@ void EPD_Show_BootMenu(uint8_t bt_highlight, uint8_t force_redraw)
     epd_refresh_count++;
 }
 
-/* 设时页数值区窗口：只刷新日期/时间/下划线，不动标题和底部提示。
- * 像素 x 41~151 → 字节列 4~20；行 40~108 覆盖两行文字与下划线。 */
-#define TIME_SET_WIN_X      4
-#define TIME_SET_WIN_W      17
-#define TIME_SET_WIN_Y      40
-#define TIME_SET_WIN_H      69
-
-/* 只画数值区（日期、时间、当前字段下划线），调用方负责选好画布 */
-static void epd_time_set_draw_values(const RX8010SJ_Time *time, uint8_t field)
+/* 各字段在屏幕上的字符区间（用于导航高亮反显 / 编辑横杠） */
+typedef struct
 {
-    uint16_t date_y = 44;
-    uint16_t time_y = 66;
+    uint16_t x0;
+    uint16_t x1;
+    uint16_t y;
+    uint16_t h;
+    uint8_t is_time_row;   /* 1=时间行（2 倍字号），0=日期行 */
+} ts_field_rect_t;
+
+/* 只算字段区间，不做绘制。date_x/time_x 由调用方按居中结果传入。 */
+static void epd_time_set_field_rect(uint8_t field, uint16_t date_x, uint16_t time_x,
+                                    ts_field_rect_t *rc)
+{
+    uint16_t date_y = 42;
+    uint16_t time_y = 62;
+
+    rc->h = FONT_CN_H;
+    rc->is_time_row = 0;
+
+    switch(field)
+    {
+    case EPD_TS_YEAR:
+        rc->x0 = date_x;
+        rc->x1 = (uint16_t)(date_x + Font16.Width * 4 - 1);
+        rc->y = date_y;
+        break;
+    case EPD_TS_MONTH:
+        rc->x0 = (uint16_t)(date_x + Font16.Width * 5);
+        rc->x1 = (uint16_t)(date_x + Font16.Width * 7 - 1);
+        rc->y = date_y;
+        break;
+    case EPD_TS_DAY:
+        rc->x0 = (uint16_t)(date_x + Font16.Width * 8);
+        rc->x1 = (uint16_t)(date_x + Font16.Width * 10 - 1);
+        rc->y = date_y;
+        break;
+    case EPD_TS_HOUR:
+        rc->x0 = time_x;
+        rc->x1 = (uint16_t)(time_x + Font16.Width * 2 * 2 - 1);
+        rc->y = time_y;
+        rc->h = (uint16_t)(Font16.Height * 2);
+        rc->is_time_row = 1;
+        break;
+    default:
+        rc->x0 = (uint16_t)(time_x + Font16.Width * 2 * 3);
+        rc->x1 = (uint16_t)(time_x + Font16.Width * 2 * 5 - 1);
+        rc->y = time_y;
+        rc->h = (uint16_t)(Font16.Height * 2);
+        rc->is_time_row = 1;
+        break;
+    }
+}
+
+/* 从文本行起点 line_x 开始，绘制第 char_idx 个字符起的 char_len 个字符。
+ * 注意 line_x 必须是整行的起始 X（不是字段起点），偏移由本函数内部计算。 */
+static void epd_draw_scaled_substr(uint16_t line_x, uint16_t y, const char *text,
+                                   uint8_t char_idx, uint8_t char_len,
+                                   const sFONT *font, uint8_t scale, UWORD fg)
+{
+    uint8_t i;
+
+    for(i = 0; i < char_len && text[char_idx + i]; i++)
+    {
+        epd_draw_scaled_char((uint16_t)(line_x + (char_idx + i) * font->Width * scale),
+                             y, text[char_idx + i], font, scale, fg);
+    }
+}
+
+/* 画日期行 + 时间行。
+ *   editing=1 且选中时间字段：该字段下方画粗横杠（编辑态）
+ *   editing=0 且选中时间字段：该字段黑底白字反显（导航态高亮光标）
+ * field 为 BACK/SAVE 时两行都按普通样式绘制。 */
+static void epd_time_set_draw_values(const RX8010SJ_Time *time, uint8_t field,
+                                     uint8_t editing)
+{
+    uint16_t date_y = 42;
+    uint16_t time_y = 62;
     uint16_t date_x;
     uint16_t time_x;
-    uint16_t ul_x0;
-    uint16_t ul_x1;
-    uint16_t ul_y;
+    ts_field_rect_t rc;
     char date_str[16];
     char time_str[8];
+    uint8_t highlight = (uint8_t)(field < EPD_TS_BACK);
+    uint8_t char_idx = 0;
+    uint8_t char_len = 0;
+    uint8_t in_date_row = (uint8_t)(field <= EPD_TS_DAY);
 
     snprintf(date_str, sizeof(date_str), "%04u-%02u-%02u",
              (unsigned int)time->year, (unsigned int)time->month,
@@ -1320,50 +1441,105 @@ static void epd_time_set_draw_values(const RX8010SJ_Time *time, uint8_t field)
     snprintf(time_str, sizeof(time_str), "%02u:%02u",
              (unsigned int)time->hour, (unsigned int)time->minute);
 
-    /* 日期行与时间行都按各自文本宽度居中，下划线跟随居中后的字符位置 */
     date_x = epd_scaled_text_x(date_str, &Font16, 1);
     time_x = epd_scaled_text_x(time_str, &Font16, 2);
 
+    /* 先按普通样式画两行 */
     epd_draw_scaled_string_left(date_x, date_y, date_str, &Font16, 1, BLACK);
     epd_draw_scaled_string_left(time_x, time_y, time_str, &Font16, 2, BLACK);
 
-    /* 按字段换算下划线位置：日期行字号 1，时间行字号 2 */
-    switch(field)
+    if(!highlight)
     {
-    case EPD_TS_YEAR:
-        ul_x0 = date_x;
-        ul_x1 = (uint16_t)(date_x + Font16.Width * 4);
-        ul_y = (uint16_t)(date_y + Font16.Height + 2);
-        break;
-    case EPD_TS_MONTH:
-        ul_x0 = (uint16_t)(date_x + Font16.Width * 5);
-        ul_x1 = (uint16_t)(date_x + Font16.Width * 7 - 1);
-        ul_y = (uint16_t)(date_y + Font16.Height + 2);
-        break;
-    case EPD_TS_DAY:
-        ul_x0 = (uint16_t)(date_x + Font16.Width * 8);
-        ul_x1 = (uint16_t)(date_x + Font16.Width * 10 - 1);
-        ul_y = (uint16_t)(date_y + Font16.Height + 2);
-        break;
-    case EPD_TS_HOUR:
-        ul_x0 = time_x;
-        ul_x1 = (uint16_t)(time_x + Font16.Width * 2 * 2 - 1);
-        ul_y = (uint16_t)(time_y + Font16.Height * 2 + 2);
-        break;
-    default:
-        ul_x0 = (uint16_t)(time_x + Font16.Width * 2 * 3);
-        ul_x1 = (uint16_t)(time_x + Font16.Width * 2 * 5 - 1);
-        ul_y = (uint16_t)(time_y + Font16.Height * 2 + 2);
-        break;
+        return;
     }
 
-    epd_fill_rect(ul_x0, ul_y, ul_x1, (uint16_t)(ul_y + 2), BLACK);
+    epd_time_set_field_rect(field, date_x, time_x, &rc);
+
+    if(editing)
+    {
+        /* 编辑态：字段下方画粗横杠 */
+        epd_fill_rect(rc.x0, (uint16_t)(rc.y + rc.h + 2),
+                      rc.x1, (uint16_t)(rc.y + rc.h + 4), BLACK);
+        return;
+    }
+
+    /* 导航态：先在字段区域涂黑，再把该字段文字以白色重画一遍（反显） */
+    epd_fill_rect(rc.x0, rc.y, rc.x1, (uint16_t)(rc.y + rc.h - 1), BLACK);
+
+    switch(field)
+    {
+    case EPD_TS_YEAR:  char_idx = 0; char_len = 4; break;
+    case EPD_TS_MONTH: char_idx = 5; char_len = 2; break;
+    case EPD_TS_DAY:   char_idx = 8; char_len = 2; break;
+    case EPD_TS_HOUR:  char_idx = 0; char_len = 2; break;
+    default:           char_idx = 3; char_len = 2; break;
+    }
+
+    if(in_date_row)
+    {
+        epd_draw_scaled_substr(date_x, date_y, date_str, char_idx, char_len,
+                               &Font16, 1, WHITE);
+    }
+    else
+    {
+        epd_draw_scaled_substr(time_x, time_y, time_str, char_idx, char_len,
+                               &Font16, 2, WHITE);
+    }
 }
 
-/* 手动设时页：逐项调整，当前项下方画一条粗下划线。
- * 首次进入整页绘制；之后调整数值只做数值区窗口局刷，缩短阻塞时间。 */
-void EPD_Show_TimeSet(const RX8010SJ_Time *time, uint8_t field)
+/* 画底部两个按钮：「返回」贴左下角、「保存」贴右下角。
+ * sel 为 EPD_TS_BACK / EPD_TS_SAVE 时对应按钮反显（导航态高亮）。 */
+static void epd_time_set_draw_buttons(uint8_t sel)
 {
+    uint16_t back_x = TIME_SET_BTN_MARGIN;
+    uint16_t save_x = (uint16_t)(EPD_UI_W - TIME_SET_BTN_MARGIN - TIME_SET_BTN_W);
+    uint8_t i;
+
+    for(i = 0; i < 2; i++)
+    {
+        uint16_t x = i ? save_x : back_x;
+        uint8_t active = (uint8_t)(i ? (sel == EPD_TS_SAVE) : (sel == EPD_TS_BACK));
+
+        Paint_DrawRectangle(x, TIME_SET_BTN_Y,
+                            (uint16_t)(x + TIME_SET_BTN_W - 1),
+                            (uint16_t)(TIME_SET_BTN_Y + TIME_SET_BTN_H - 1),
+                            BLACK, active ? DRAW_FILL_FULL : DRAW_FILL_EMPTY,
+                            DOT_PIXEL_1X1);
+
+        epd_draw_centered_utf8_rect(x, (uint16_t)(x + TIME_SET_BTN_W - 1),
+                                    (uint16_t)(TIME_SET_BTN_Y +
+                                               (TIME_SET_BTN_H - FONT_CN_H) / 2),
+                                    (i == 0) ? "返回" : "保存",
+                                    active ? WHITE : BLACK);
+    }
+}
+
+/* 手动设时页：导航态用 键1/键2 选字段（反显高亮），键3 进入编辑；
+ * 编辑态 键1/键2 调值（横杠标记当前字段），键3 退出编辑。
+ * 首次进入整页绘制；之后按「数值区 / 按钮区」分别做窗口局刷。 */
+/* 设时页增量刷新窗口：必须覆盖「数值区 + 按钮区」的并集。
+ * 数值：y 42..101；按钮：y 114..147；并集 y 38..151。
+ * x：数值 41..150、按钮 8..183 -> 并集 8..183（字节列 1..22）。
+ *
+ * 关键：这里只能发起 **一次** 局部刷新。分两次调用 EPD_PartRefresh_Window
+ * 会让面板连跑两遍局刷波形，中途会把上一次的画面重新驱动出来，
+ * 表现为高亮跳到新项后又瞬间退回上一项。 */
+#define TS_WIN_X   1
+#define TS_WIN_W   22
+#define TS_WIN_Y   38
+#define TS_WIN_H   114
+
+static uint8_t time_set_value_equal(const RX8010SJ_Time *a, const RX8010SJ_Time *b)
+{
+    return (uint8_t)(a->year == b->year && a->month == b->month &&
+                     a->day == b->day && a->hour == b->hour &&
+                     a->minute == b->minute);
+}
+
+void EPD_Show_TimeSet(const RX8010SJ_Time *time, uint8_t field, uint8_t editing)
+{
+    uint8_t changed;
+
     if(!time)
     {
         return;
@@ -1378,29 +1554,44 @@ void EPD_Show_TimeSet(const RX8010SJ_Time *time, uint8_t field)
         Paint_SelectImage(EPD_Image);
         Paint_Clear(WHITE);
 
-        epd_draw_centered_utf8(12, "时间设定", BLACK);
-        epd_time_set_draw_values(time, field);
-        epd_draw_centered_utf8(124, "键1减 键2加 键3确认", BLACK);
-        epd_draw_centered_utf8(146, "长按3返回", BLACK);
+        epd_draw_centered_utf8(10, "时间设定", BLACK);
+        epd_time_set_draw_values(time, field, editing);
+        epd_time_set_draw_buttons(field);
 
         epd_time_set_drawn = 1;
+        epd_time_set_last_field = field;
+        epd_time_set_last_editing = editing;
+        epd_time_set_last_time = *time;
         epd_refresh_frame(0, 0);
         return;
     }
 
-    /* 仅数值变化：清窗口后重画数值区，局部刷新 */
+    changed = (uint8_t)(field != epd_time_set_last_field ||
+                        editing != epd_time_set_last_editing ||
+                        !time_set_value_equal(time, &epd_time_set_last_time));
+    if(!changed)
+    {
+        return;
+    }
+
+    /* 在窗口内清屏后重画数值与按钮，然后只发起一次局部刷新。 */
     Paint_SelectImage(EPD_Image);
-    Paint_ClearWindows(TIME_SET_WIN_X * 8, TIME_SET_WIN_Y,
-                       TIME_SET_WIN_X * 8 + TIME_SET_WIN_W * 8,
-                       TIME_SET_WIN_Y + TIME_SET_WIN_H, WHITE);
-    epd_time_set_draw_values(time, field);
+    Paint_ClearWindows(TS_WIN_X * 8, TS_WIN_Y,
+                       TS_WIN_X * 8 + TS_WIN_W * 8,
+                       TS_WIN_Y + TS_WIN_H, WHITE);
+
+    epd_time_set_draw_values(time, field, editing);
+    epd_time_set_draw_buttons(field);
 
     EPD_HW_Init_GUI();
-    EPD_PartRefresh_Window(TIME_SET_WIN_X, TIME_SET_WIN_Y,
+    EPD_PartRefresh_Window(TS_WIN_X, TS_WIN_Y,
                            EPD_Image, EPD_Image_prev,
-                           TIME_SET_WIN_W, TIME_SET_WIN_H);
+                           TS_WIN_W, TS_WIN_H);
 
-    /* 显式全刷请求已由本次局刷消费 */
+    epd_time_set_last_field = field;
+    epd_time_set_last_editing = editing;
+    epd_time_set_last_time = *time;
+
     tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
     epd_force_full_refresh_once = 0;
     epd_refresh_count++;
@@ -1416,6 +1607,101 @@ void EPD_Show_TimeSetFail(void)
 void EPD_TimeSet_Invalidate(void)
 {
     epd_time_set_drawn = 0;
+    epd_time_set_last_field = 0xFF;
+    epd_time_set_last_editing = 0xFF;
+}
+
+/* 绘制设置页的单个选项：选中项黑底白字，未选中项白底黑框黑字。
+ * 蜂鸣器项在右侧附带开关状态文字。 */
+static void epd_set_menu_draw_row(uint8_t sel, uint8_t row, uint8_t buzzer_on)
+{
+    uint16_t row_y = (uint16_t)(SET_MENU_ROW0_Y +
+                                row * (SET_MENU_ROW_H + SET_MENU_ROW_GAP));
+    uint16_t row_text_y = (uint16_t)(row_y + (SET_MENU_ROW_H - FONT_CN_H) / 2);
+    uint8_t active = (uint8_t)(row == sel);
+    UWORD fg = active ? WHITE : BLACK;
+    char label[16];
+
+    Paint_DrawRectangle(BOOT_MENU_BOX_X0, row_y,
+                        BOOT_MENU_BOX_X1, (uint16_t)(row_y + SET_MENU_ROW_H - 1),
+                        BLACK, active ? DRAW_FILL_FULL : DRAW_FILL_EMPTY,
+                        DOT_PIXEL_1X1);
+
+    if(row == EPD_SET_BUZZER)
+    {
+        /* 蜂鸣器项附带开关状态，单行显示避免超出 34px 行高 */
+        snprintf(label, sizeof(label), "蜂鸣器 %s", buzzer_on ? "开" : "关");
+        epd_draw_centered_utf8(row_text_y, label, fg);
+        return;
+    }
+
+    snprintf(label, sizeof(label), "%s",
+             (row == EPD_SET_TIME) ? "手动设定时间" : "返回");
+    epd_draw_centered_utf8(row_text_y, label, fg);
+}
+
+/* 设置页：手动设定时间 / 蜂鸣器开关 / 返回。
+ * 首次绘制或 force_redraw 时整页绘制并全刷；之后仅选中项变化，
+ * 只重刷三个选项覆盖的窗口区域。 */
+void EPD_Show_SetMenu(uint8_t selection, uint8_t buzzer_on, uint8_t force_redraw)
+{
+    uint8_t sel = (selection < SET_MENU_NUM_ROWS) ? selection : 0;
+    uint8_t row;
+
+    BUZZER_Stop();
+    epd_overlay_lock = 1;
+
+    if(!epd_set_menu_drawn || force_redraw)
+    {
+        Paint_NewImage(EPD_Image, EPD_WIDTH, EPD_HEIGHT, EPD_UI_ROTATE, WHITE);
+        Paint_SelectImage(EPD_Image);
+        Paint_Clear(WHITE);
+
+        epd_draw_centered_utf8(4, "设置", BLACK);
+
+        for(row = 0; row < SET_MENU_NUM_ROWS; row++)
+        {
+            epd_set_menu_draw_row(sel, row, buzzer_on);
+        }
+
+        epd_set_menu_drawn = 1;
+        epd_set_menu_sel = sel;
+        epd_set_menu_buzzer = buzzer_on ? 1 : 0;
+        epd_refresh_frame(1, 0);
+        return;
+    }
+
+    if(sel == epd_set_menu_sel &&
+       (buzzer_on ? 1 : 0) == epd_set_menu_buzzer)
+    {
+        return;
+    }
+
+    /* 只重画选项区并做窗口局刷。先清窗口，避免旧的选中黑底残留在帧缓存。 */
+    Paint_SelectImage(EPD_Image);
+    Paint_ClearWindows(SET_MENU_WIN_X * 8, SET_MENU_WIN_Y,
+                       SET_MENU_WIN_X * 8 + SET_MENU_WIN_W * 8,
+                       SET_MENU_WIN_Y + SET_MENU_WIN_H, WHITE);
+    for(row = 0; row < SET_MENU_NUM_ROWS; row++)
+    {
+        epd_set_menu_draw_row(sel, row, buzzer_on);
+    }
+
+    EPD_HW_Init_GUI();
+    EPD_PartRefresh_Window(SET_MENU_WIN_X, SET_MENU_WIN_Y,
+                           EPD_Image, EPD_Image_prev,
+                           SET_MENU_WIN_W, SET_MENU_WIN_H);
+
+    tmos_memcpy(EPD_Image_prev, EPD_Image, sizeof(EPD_Image));
+    epd_set_menu_sel = sel;
+    epd_set_menu_buzzer = buzzer_on ? 1 : 0;
+    epd_refresh_count++;
+}
+
+/* 离开设置页后调用：下次进入整页重绘，避免上一页内容残留 */
+void EPD_SetMenu_Invalidate(void)
+{
+    epd_set_menu_drawn = 0;
 }
 
 void EPD_RequestFullRefreshOnce(void)

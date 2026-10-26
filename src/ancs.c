@@ -190,6 +190,20 @@ const char *Ancs_GetDeviceName(void)
     return (const char *)attDeviceName;
 }
 
+void Ancs_SetAdvertising(uint8_t enable)
+{
+    uint8_t advertising_enable = enable ? TRUE : FALSE;
+
+    if(ancs_conn_list.connHandle != GAP_CONNHANDLE_INIT)
+    {
+        /* 已连接时不动广播状态 */
+        return;
+    }
+
+    GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &advertising_enable);
+    PRINT("adv %s\n", advertising_enable ? "on" : "off");
+}
+
 // 扫描响应里完整名的 MAC 后缀首字节下标：2(长度+类型) + "FJ WATCH-" 的 9 个字符
 #define SCAN_RSP_SUFFIX_IDX        11
 
@@ -311,7 +325,9 @@ void peripheral_ancs_client_init(void)
 
     // Setup the GAP Peripheral Role Profile
     {
-        uint8_t  initial_advertising_enable = TRUE;
+        /* 上电不广播：只有进入「蓝牙时间同步」页面时才开启，
+         * 避免开机选择页/设置页/时钟页被手机搜到。 */
+        uint8_t  initial_advertising_enable = FALSE;
         uint8_t  advertising_event_type = GAP_ADTYPE_ADV_IND;
         uint16_t desired_min_interval = DEFAULT_DESIRED_MIN_CONN_INTERVAL;
         uint16_t desired_max_interval = DEFAULT_DESIRED_MAX_CONN_INTERVAL;
@@ -734,11 +750,8 @@ static void Peripheral_LinkTerminated(gapRoleEvent_t *pEvent)
         ancs_conn_list.connSlaveLatency = 0;
         ancs_conn_list.connTimeout = 0;
 
-        // Restart advertising
-        {
-            uint8_t advertising_enable = TRUE;
-            GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t), &advertising_enable);
-        }
+        /* 不在这里自动重开广播：是否广播由应用层（蓝牙同步页面）决定，
+         * 否则断开连接后设备会重新变得可被搜索。 */
 
         ancs_reinit(&ancs_c);
     }

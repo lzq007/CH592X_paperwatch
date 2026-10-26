@@ -51,6 +51,18 @@ void BUZZER_NotifyBeep(void);
 void BUZZER_KeyBeep(void);
 
 /**
+ * @brief   设置蜂鸣器总开关（关闭后提示音与按键音都不响）
+ */
+void BUZZER_SetEnabled(uint8_t enabled);
+
+/**
+ * @brief   查询蜂鸣器总开关
+ *
+ * @return  1=开启，0=关闭
+ */
+uint8_t BUZZER_IsEnabled(void);
+
+/**
  * @brief   查询是否有鸣响序列正在进行（含静音间隔）
  *
  * @return  1=正在鸣响或间隔中，0=空闲

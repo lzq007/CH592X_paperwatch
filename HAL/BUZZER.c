@@ -36,6 +36,9 @@ static uint8_t buzzerStage;
  * 把"滴"声拉长，调用方可据此把刷新推迟到鸣响结束。 */
 static volatile uint8_t buzzerActive;
 
+/* 用户开关：关闭后所有提示音静音（设置页「蜂鸣器」项控制） */
+static volatile uint8_t buzzerEnabled = 1;
+
 /* 蜂鸣器 TMOS 事件处理 */
 static tmosEvents BUZZER_ProcessEvent(tmosTaskID task_id, tmosEvents events);
 
@@ -139,6 +142,11 @@ void BUZZER_Init(void)
  *******************************************************************************/
 void BUZZER_On(uint16_t ms)
 {
+    if(!buzzerEnabled)
+    {
+        return;
+    }
+
     PWMX_ACTOUT(BUZZER_PWM_CH, 128, High_Level, ENABLE);
     if(ms)
     {
@@ -190,6 +198,11 @@ void BUZZER_Stop(void)
  *******************************************************************************/
 void BUZZER_NotifyBeep(void)
 {
+    if(!buzzerEnabled)
+    {
+        return;
+    }
+
     /* 两声：鸣-停-鸣-停 */
     BUZZER_Stop();
     buzzerBeepLeft = BUZZER_TIMES;
@@ -201,6 +214,20 @@ void BUZZER_NotifyBeep(void)
 uint8_t BUZZER_IsBeeping(void)
 {
     return buzzerActive;
+}
+
+void BUZZER_SetEnabled(uint8_t enabled)
+{
+    buzzerEnabled = enabled ? 1 : 0;
+    if(!buzzerEnabled)
+    {
+        BUZZER_Stop();
+    }
+}
+
+uint8_t BUZZER_IsEnabled(void)
+{
+    return buzzerEnabled;
 }
 
 /*******************************************************************************
@@ -218,6 +245,11 @@ uint8_t BUZZER_IsBeeping(void)
  *******************************************************************************/
 void BUZZER_KeyBeep(void)
 {
+    if(!buzzerEnabled)
+    {
+        return;
+    }
+
     BUZZER_Stop();
     PWMX_ACTOUT(BUZZER_PWM_CH, 128, High_Level, ENABLE);
     DelayMs(BUZZER_KEY_MS);

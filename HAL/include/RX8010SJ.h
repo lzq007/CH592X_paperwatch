@@ -7,6 +7,14 @@ extern "C" {
 
 #include "CH59x_common.h"
 
+/* RTC 后端选择：
+ *   1 = 外部 RTC 芯片 RX8010SJ（I2C，默认）
+ *   0 = 使用 MCU 片内 RTC（32.768kHz LSE 计数）
+ * 上层统一调用 RX8010SJ_* 接口，切换只需改这一个宏。 */
+#ifndef USE_EXT_RTC
+#define USE_EXT_RTC    1
+#endif
+
 typedef struct
 {
     uint16_t year;

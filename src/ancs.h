@@ -133,6 +133,11 @@ void peripheral_ancs_client_init(void);
 /* 当前广播名（含 MAC 后缀），用于在其他界面展示，如等待同步页 */
 const char *Ancs_GetDeviceName(void);
 
+/**
+ * @brief   开/关 BLE 广播。仅在「蓝牙时间同步」页面开启，其余页面关闭。
+ */
+void Ancs_SetAdvertising(uint8_t enable);
+
 void ancs_subscribe_cb_register(struct bt_ancs_subscribe_cb *cb);
 
 /*********************************************************************

@@ -21,7 +21,7 @@ extern "C" {
 /**************************************************************************************************
  *                                              MACROS
  **************************************************************************************************/
-#define HAL_KEY_POLLING_VALUE    100
+#define HAL_KEY_POLLING_VALUE    30
 
 /* Switches (keys) */
 #define HAL_KEY_SW_1             0x01  // key1
@@ -84,6 +84,16 @@ void HAL_KeyInit(void);
  * @brief   This is for internal used by hal_driver
  */
 void HAL_KeyPoll(void);
+
+/**
+ * @brief   处理 GPIO 中断投递的按键事件（读一次当前状态后回调）
+ */
+void HAL_KeyDispatch(void);
+
+/**
+ * @brief   查询是否有中断待处理
+ */
+uint8_t HAL_KeyIrqPending(void);
 
 /**
  * @brief   Configure the Key serivce

@@ -28,6 +28,7 @@ extern "C" {
 /* hal task Event */
 #define LED_BLINK_EVENT       0x0001
 #define HAL_KEY_EVENT         0x0002
+#define HAL_KEY_IRQ_EVENT     0x0004
 #define HAL_REG_INIT_EVENT    0x2000
 #define HAL_TEST_EVENT        0x4000
 

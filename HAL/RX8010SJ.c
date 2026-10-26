@@ -1,4 +1,7 @@
 #include "RX8010SJ.h"
+
+#if USE_EXT_RTC
+
 #include "CH59x_gpio.h"
 
 #define RX8010SJ_I2C_ADDR_DEFAULT 0x32
@@ -365,6 +368,8 @@ static uint8_t rx8010_time_is_valid(const RX8010SJ_Time *time)
     return 1;
 }
 
+/* ==================== 外部 RTC 芯片 RX8010SJ（I2C） ==================== */
+
 void RX8010SJ_Init(void)
 {
     uint8_t addr_index;
@@ -556,3 +561,101 @@ uint8_t RX8010SJ_Begin(RX8010SJ_Time *time)
 
     return 1;
 }
+
+#else  /* !USE_EXT_RTC */
+
+/* ==================== MCU 片内 RTC ==================== */
+
+#include "RTC.h"
+#include <string.h>
+
+/* 片内 RTC 上电后从固定时间开始走时（没有后备电池，掉电即丢）。
+ * 需要准确时间时用「手动设定时间」或蓝牙同步写入。 */
+#define MCU_RTC_START_YEAR   2026
+#define MCU_RTC_START_MONTH  1
+#define MCU_RTC_START_DAY    1
+#define MCU_RTC_START_HOUR   0
+#define MCU_RTC_START_MINUTE 0
+#define MCU_RTC_START_SECOND 0
+
+static uint8_t mcu_rtc_begin_done = 0;
+
+void RX8010SJ_Init(void)
+{
+    /* 片内 RTC 的 32.768kHz 时钟由 HAL_TimeInit() 在 HAL_Init() 中配置 */
+}
+
+uint8_t RX8010SJ_Begin(RX8010SJ_Time *time)
+{
+    if(!mcu_rtc_begin_done)
+    {
+        RTC_InitTime(MCU_RTC_START_YEAR, MCU_RTC_START_MONTH, MCU_RTC_START_DAY,
+                     MCU_RTC_START_HOUR, MCU_RTC_START_MINUTE, MCU_RTC_START_SECOND);
+        mcu_rtc_begin_done = 1;
+        PRINT("MCU RTC start %04u-%02u-%02u %02u:%02u:%02u\n",
+              MCU_RTC_START_YEAR, MCU_RTC_START_MONTH, MCU_RTC_START_DAY,
+              MCU_RTC_START_HOUR, MCU_RTC_START_MINUTE, MCU_RTC_START_SECOND);
+    }
+
+    if(!RX8010SJ_ReadTime(time))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+uint8_t RX8010SJ_ReadTime(RX8010SJ_Time *time)
+{
+    static const uint8_t month_offset[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    uint16_t y, mon, d, h, m, sec;
+    uint16_t wy;
+
+    if(!time)
+    {
+        return 0;
+    }
+
+    RTC_GetTime(&y, &mon, &d, &h, &m, &sec);
+
+    time->year = y;
+    time->month = (uint8_t)mon;
+    time->day = (uint8_t)d;
+    time->hour = (uint8_t)h;
+    time->minute = (uint8_t)m;
+    time->second = (uint8_t)sec;
+
+    /* RTC_GetTime 不返回星期，按年月日推算 */
+    wy = y;
+    if(mon < 3)
+    {
+        wy--;
+    }
+    time->weekday = (uint8_t)((wy + wy / 4 - wy / 100 + wy / 400 +
+                               month_offset[(mon >= 1 && mon <= 12) ? (mon - 1) : 0] +
+                               d) % 7);
+
+    return 1;
+}
+
+uint8_t RX8010SJ_SetTime(const RX8010SJ_Time *time)
+{
+    if(!time)
+    {
+        return 0;
+    }
+    if(time->year < 2020 || time->year > 2064 ||
+       time->month < 1 || time->month > 12 ||
+       time->day < 1 || time->day > 31 ||
+       time->hour > 23 || time->minute > 59 || time->second > 59)
+    {
+        return 0;
+    }
+
+    RTC_InitTime(time->year, time->month, time->day,
+                 time->hour, time->minute, time->second);
+    mcu_rtc_begin_done = 1;
+    return 1;
+}
+
+#endif /* USE_EXT_RTC */

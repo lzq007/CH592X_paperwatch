@@ -217,10 +217,18 @@ tmosEvents HAL_ProcessEvent(tmosTaskID task_id, tmosEvents events)
     if(events & HAL_KEY_EVENT)
     {
 #if(defined HAL_KEY) && (HAL_KEY == TRUE)
-        HAL_KeyPoll(); /* Check for keys */
-        tmos_start_task(halTaskID, HAL_KEY_EVENT, MS1_TO_SYSTEM_TIME(100));
+        HAL_KeyPoll(); /* 采样一次，主要用于识别"已松开" */
+        tmos_start_task(halTaskID, HAL_KEY_EVENT, MS1_TO_SYSTEM_TIME(HAL_KEY_POLLING_VALUE));
 #endif
         return events ^ HAL_KEY_EVENT;
+    }
+    if(events & HAL_KEY_IRQ_EVENT)
+    {
+#if(defined HAL_KEY) && (HAL_KEY == TRUE)
+        /* 由 GPIO 中断投递：按键刚按下，立即分发一次 */
+        HAL_KeyDispatch();
+#endif
+        return events ^ HAL_KEY_IRQ_EVENT;
     }
     if(events & HAL_REG_INIT_EVENT)
     {
